@@ -1,0 +1,6 @@
+**/.DS_Store
+.idea/*
+build/*
+dist/*
+vital_agent_container_sdk.egg-info/*
+
