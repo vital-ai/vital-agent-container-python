@@ -3,4 +3,6 @@
 build/*
 dist/*
 vital_agent_container_sdk.egg-info/*
+**/*.yaml
+**/__pycache__/*
 

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='vital-agent-container-sdk',
-    version='0.1.0',
+    version='0.1.1',
     author='Marc Hadfield',
     author_email='marc@vital.ai',
     description='Vital Agent Container SDK',
@@ -21,8 +21,24 @@ setup(
     },
     license='Apache License 2.0',
     install_requires=[
-        'vital-ai-vitalsigns>=0.1.19',
-        'vital-ai-aimp>=0.1.6',
+        'vital-ai-vitalsigns==0.1.19',
+        'vital-ai-aimp==0.1.6',
+        'httpx==0.26.0',
+        'python-json-logger==2.0.7',
+        'python-dotenv==1.0.1',
+        'uvicorn[standard]==0.27.0.post1',
+        'fastapi==0.109.2',
+        'dataclasses-json==0.5.7',
+        'aiohttp==3.9.0',
+        'aiosignal==1.2.0',
+        'anyio==4.2.0',
+        'async-timeout==4.0.3',
+        'starlette==0.36.3',
+        'marshmallow==3.19.0',
+        'pyyaml==6.0.1',
+        'requests==2.31.0',
+        'Pillow==10.2.0',
+        'websockets==12.0'
     ],
     extras_require={
         'dev': [
