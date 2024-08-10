@@ -8,6 +8,7 @@ def main():
     print('Test Agent Container App')
 
     current_file_directory = os.path.dirname(os.path.abspath(__file__))
+
     parent_directory = os.path.dirname(current_file_directory)
 
     app_home = parent_directory

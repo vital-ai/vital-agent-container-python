@@ -42,11 +42,13 @@ class AgentContainerApp(FastAPI):
         self.app_home = app_home
         load_dotenv()
         self.config = ConfigUtils.load_config(app_home)
+        self.message_processor = AIMPMessageProcessor()
         self.add_routes()
 
     async def process_ws_message(self, client: httpx.AsyncClient, websocket: WebSocket, data: str,
                                  started_event: asyncio.Event):
-        await AIMPMessageProcessor.process_message(self.handler, self.config, client, websocket, data, started_event)
+        print(f"process_ws_message: Processing: {data}")
+        await self.message_processor.process_message(self.handler, self.config, client, websocket, data, started_event)
 
     def add_routes(self):
         @self.get("/health")
@@ -67,8 +69,9 @@ class AgentContainerApp(FastAPI):
 
                     logger.info(f"Received message from {websocket.client.host}:{websocket.client.port}: {data}")
                     message_obj = json.loads(data)
-                    message_type = message_obj[0].get("type")
-                    message_intent = message_obj[0].get("http://vital.ai/ontology/vital-aimp#hasIntent")
+                    logger.info(f"Received message: {message_obj}")
+                    message_type = message_obj[0].get("type", None)
+                    message_intent = message_obj[0].get("http://vital.ai/ontology/vital-aimp#hasIntent", None)
                     logger.info(f"message_type: {message_type}")
                     logger.info(f"message_intent: {message_intent}")
 
@@ -96,9 +99,12 @@ class AgentContainerApp(FastAPI):
                     else:
                         logger.info(f"Processing message: {data}")
                         started_event = asyncio.Event()
-                        task = asyncio.create_task(self.process_ws_message(self.handler, client, websocket, data, started_event))
+                        task = asyncio.create_task(self.process_ws_message(client, websocket, data, started_event))
                         background_tasks.append(task)
                         await started_event.wait()
+                        logger.info(f"Completed Processing message: {data}")
+                        # break out of infinite loop
+                        break
             except WebSocketDisconnect:
                 logger.info("WebSocket connection closed by the client.")
                 # still try to close it in finally?

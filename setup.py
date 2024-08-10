@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='vital-agent-container-sdk',
-    version='0.1.1',
+    version='0.1.2',
     author='Marc Hadfield',
     author_email='marc@vital.ai',
     description='Vital Agent Container SDK',
