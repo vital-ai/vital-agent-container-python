@@ -47,7 +47,8 @@ class AgentContainerApp(FastAPI):
 
     async def process_ws_message(self, client: httpx.AsyncClient, websocket: WebSocket, data: str,
                                  started_event: asyncio.Event):
-        print(f"process_ws_message: Processing: {data}")
+
+        logger.info(f"process_ws_message: Processing: {data}")
         await self.message_processor.process_message(self.handler, self.config, client, websocket, data, started_event)
 
     def add_routes(self):

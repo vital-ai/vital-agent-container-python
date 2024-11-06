@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
 
@@ -9,10 +10,20 @@ class AIMPMessageProcessor:
         pass
 
     async def process_message(self, handler: AIMPMessageHandlerInf, app_config, client, websocket, data, started_event):
-        print(f"Processing: {data}")
+
+        logger = logging.getLogger("AIMPMessageProcessor")
+        logger.setLevel(logging.INFO)
+
+        logger.info(f"Processing: {data}")
+
         try:
             return await handler.process_message(app_config, client, websocket, data, started_event)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as e:
             # log canceling
-            raise
+            logger.error(f"Canceling {e}")
+            raise e
+        except Exception as e:
+            logger.error(f"Exception {e}")
+            raise e
+
 
