@@ -24,7 +24,9 @@ formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(messa
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setFormatter(formatter)
 
-log_file = "/var/log/agentcontainer/app.log"
+# log_file = "/var/log/agentcontainer/app.log"
+
+log_file = "app.log"
 
 file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5)
 file_handler.setFormatter(formatter)
@@ -49,6 +51,7 @@ class AgentContainerApp(FastAPI):
                                  started_event: asyncio.Event):
 
         logger.info(f"process_ws_message: Processing: {data}")
+
         await self.message_processor.process_message(self.handler, self.config, client, websocket, data, started_event)
 
     def add_routes(self):
