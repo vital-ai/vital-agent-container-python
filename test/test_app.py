@@ -15,7 +15,7 @@ def main():
 
     handler = AIMPEchoMessageHandler()
 
-    agent_container_app = AgentContainerApp(handler, app_home)
+    agent_container_app = AgentContainerApp(handler, app_home=app_home)
 
     uvicorn.run(host="0.0.0.0", port=6006, app=agent_container_app)
 

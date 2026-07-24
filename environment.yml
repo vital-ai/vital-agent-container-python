@@ -1,0 +1,39 @@
+name: vital-agent-container-python
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.12
+  - pip
+  - pip:
+    - vital-ai-vitalsigns>=0.1.47
+    - vital-ai-aimp>=0.1.12
+    - httpx>=0.28.0
+    - python-json-logger>=2.0.7
+    - python-dotenv>=1.0.1
+    - uvicorn[standard]>=0.35.0
+    - fastapi>=0.116.0
+    - dataclasses-json>=0.5.7
+    - aiohttp>=3.9.0
+    - aiosignal>=1.2.0
+    - anyio>=4.2.0
+    - async-timeout>=4.0.3
+    - starlette>=0.36.3
+    - marshmallow>=3.19.0
+    - pyyaml>=6.0.1
+    - requests>=2.31.0
+    - pyjwt>=2.8.0
+    - cryptography>=41.0.0
+    - Pillow>=10.2.0
+    - websockets>=12.0
+    # Development dependencies
+    - pytest>=7.0.0
+    - pytest-asyncio>=0.21.0
+    - pytest-cov>=4.0.0
+    - black>=23.0.0
+    - isort>=5.12.0
+    - flake8>=6.0.0
+    - mypy>=1.0.0
+    - pre-commit>=3.0.0
+    - sphinx>=6.0.0
+    - sphinx-rtd-theme>=1.2.0
