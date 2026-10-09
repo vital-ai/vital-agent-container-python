@@ -68,6 +68,10 @@ class _BinaryFrame(Exception):
     """The client sent a binary WebSocket frame; the protocol is text (JSON) only."""
 
 
+class _ClientNotReading(Exception):
+    """A control message couldn't be sent in time: the client has stopped reading."""
+
+
 class _ConnectionRejected(Exception):
     """Raised by a connection's JWT step to end the connection with a specific close code."""
 
@@ -496,6 +500,10 @@ class AgentContainerApp(FastAPI):
 
         except (WebSocketDisconnect, ConnectionClosed):
             logger.info(f"Client {client_info} disconnected after {message_count} messages")
+        except _ClientNotReading:
+            logger.warning(f"Client {client_info} stopped reading: a control message wasn't sent within "
+                           f"{CONTROL_SEND_TIMEOUT_SECONDS}s; closing")
+            close_code, close_reason = CloseCode.POLICY_VIOLATION, "Client not reading"
         except _ConnectionRejected as rejected:
             close_code, close_reason = rejected.code, rejected.reason
         except asyncio.CancelledError:
@@ -526,9 +534,7 @@ class AgentContainerApp(FastAPI):
         try:
             await asyncio.wait_for(channel.send_text(json.dumps(message)), CONTROL_SEND_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            logger.warning(f"Control message not sent within {CONTROL_SEND_TIMEOUT_SECONDS}s; "
-                           f"treating the client as gone")
-            raise ConnectionClosed("client is not reading") from None
+            raise _ClientNotReading() from None
 
     @staticmethod
     async def _receive_text(websocket: WebSocket) -> str:

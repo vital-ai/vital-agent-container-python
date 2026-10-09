@@ -764,7 +764,8 @@ async def test_control_send_cannot_stall_the_loop(monkeypatch):
 
     await asyncio.wait_for(app._run_connection(websocket, "test", no_jwt), timeout=3)
     assert handler.finally_ran.is_set()
-    assert websocket.closed_with is not None
+    # A slow client isn't told "server error" (1011): it gets a distinct close
+    assert websocket.closed_with == (CloseCode.POLICY_VIOLATION, "Client not reading")
 
 
 class ClientRecordingHandler(AIMPMessageHandlerInf):
@@ -872,6 +873,7 @@ def test_close_codes_are_stable():
     assert CloseCode.NORMAL == 1000
     assert CloseCode.GOING_AWAY == 1001
     assert CloseCode.UNSUPPORTED_DATA == 1003
+    assert CloseCode.POLICY_VIOLATION == 1008
     assert CloseCode.INTERNAL_ERROR == 1011
     assert CloseCode.UNAUTHORIZED == 4001
     assert CloseCode.UNSUPPORTED_PROTOCOL == 4002

@@ -161,8 +161,8 @@ with a close request; wait for `done` first.
 
 **A client that stops reading is disconnected.** Control messages (`done`, `busy`, ...) must be
 sent within 5s (`CONTROL_SEND_TIMEOUT_SECONDS`), including any wait behind a handler send that's
-stuck because the client isn't reading. If not, the client is treated as gone and the connection
-ends.
+stuck because the client isn't reading. If not, the container logs a WARNING and closes with
+**1008** `Client not reading`, not 1011, because the server didn't fail.
 
 **JWT enforcement is unchanged by this protocol.** Header mode validates the token before the
 connection is accepted. Payload mode checks the JWT on **every** message, including `interrupt` and
@@ -178,6 +178,7 @@ informational.
 | 4008 | `Handler timeout`: the handler exceeded `WS_TASK_TIMEOUT_SECONDS` |
 | 1011 | `Handler error` (the handler raised), or an unexpected container error |
 | 1003 | the message was not valid JSON, not an AIMP message list, or a binary frame |
+| 1008 | `Client not reading`: a control message couldn't be sent within 5s |
 | 4002 | the client didn't offer the `vital-agent.v2` subprotocol |
 | 4001 | JWT payload mode rejected a message. In **header mode** a bad or missing token is rejected *before* the connection is accepted, so the client sees the handshake fail with **HTTP 403**, not a 4001 close. |
 | 1001 | `Server shutting down` |

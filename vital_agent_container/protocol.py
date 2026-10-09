@@ -19,7 +19,8 @@ INTENT_CLOSE = "close"
 class CloseCode(IntEnum):
     NORMAL = 1000             # closed on request (service or client), or idle timeout
     GOING_AWAY = 1001         # server shutting down
-    UNSUPPORTED_DATA = 1003   # message is not valid JSON or not an AIMP message list
+    UNSUPPORTED_DATA = 1003   # message is not valid JSON, not an AIMP message list, or binary
+    POLICY_VIOLATION = 1008   # client stopped reading (a control message couldn't be sent)
     INTERNAL_ERROR = 1011     # handler raised, or an unexpected SDK error
     UNAUTHORIZED = 4001       # JWT enforcement rejected the connection
     UNSUPPORTED_PROTOCOL = 4002  # client did not offer SUBPROTOCOL
