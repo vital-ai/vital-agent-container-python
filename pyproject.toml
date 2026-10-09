@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vital-agent-container-sdk"
-version = "0.1.18"
+version = "0.1.19"
 description = "Vital Agent Container SDK"
 readme = "README.md"
 license = {text = "Apache License 2.0"}

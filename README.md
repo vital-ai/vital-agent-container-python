@@ -89,6 +89,24 @@ app = AgentContainerApp(handler, app_config=config)
 
 2. Update the file with your specific configuration.
 
+### WebSocket connection lifecycle
+
+A connection can carry any number of messages, one at a time. A message that arrives while the
+previous one is still being handled is rejected with `processing task. ignoring message.`.
+Either side may close the connection. A handler that closes the socket when it's done is a normal
+end and is logged at INFO.
+
+Two timeouts bound how long a connection stays open:
+
+| Env var | Constructor kwarg | Default | Effect |
+|---|---|---|---|
+| `WS_IDLE_TIMEOUT_SECONDS` | `ws_idle_timeout` | `300` | Closes the connection (code 1000, `Idle timeout`) after this long with no messages and no handler running. A running handler is never cancelled by this timeout. |
+| `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Cancels a handler that runs longer than this and closes the connection (code 1011, `Handler timeout`). Logged at ERROR. |
+
+Set either one to `0` (or empty) to disable it. A constructor kwarg overrides the env var.
+`WS_TASK_TIMEOUT_SECONDS` is a backstop. Handlers should still enforce their own, shorter deadlines
+so they can send a proper error response.
+
 ## Usage
 
 ### Basic Implementation
