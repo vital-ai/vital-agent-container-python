@@ -172,6 +172,9 @@ informational.
   container sends **one** `sdk.status ready`, and requests are accepted again. A handler that ignores
   cancellation therefore holds up its own connection, not the process. The cap is per connection;
   abandoned handlers across the process are only logged, with a running count.
+- While a `ready` is owed no handler is running, so the idle timeout applies. If an interrupted
+  handler never finishes, the client gets `1000 Idle timeout` instead of `ready`. Clients should
+  treat that as "open a new connection", not as an error.
 - On the deadline the container closes with 4008 *before* cancelling the handler, even if a handler
   send is stuck (it waits at most 1s for it). A handler can't
   replace that with its own reply, so enforce a shorter deadline in the handler if you want to answer
