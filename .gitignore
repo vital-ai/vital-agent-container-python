@@ -8,4 +8,5 @@ vital_agent_container_sdk.egg-info/*
 
 planning
 *.log
+*.log.*
 

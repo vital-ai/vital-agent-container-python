@@ -407,10 +407,13 @@ class AgentContainerApp(FastAPI):
         except Exception as e:
             logger.error(f"WebSocket communication error for {client_info}: {str(e)}")
         finally:
-            if closed_by_server:
-                await self._let_closing_tasks_finish(background_tasks)
-            await self._cleanup_websocket_resources(client, background_tasks, client_info,
-                                                    websocket=websocket, close_code=close_code, close_reason=close_reason)
+            try:
+                if closed_by_server:
+                    await self._let_closing_tasks_finish(background_tasks)
+            finally:
+                # Runs even if the server is cancelled during the grace wait
+                await self._cleanup_websocket_resources(client, background_tasks, client_info,
+                                                        websocket=websocket, close_code=close_code, close_reason=close_reason)
 
     async def _let_closing_tasks_finish(self, background_tasks: list):
         """Give a task that closed the socket time to finish before cleanup cancels it.

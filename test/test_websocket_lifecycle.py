@@ -13,8 +13,9 @@ from unittest.mock import patch, MagicMock
 import jwt
 import pytest
 from starlette.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+from vital_agent_container import agent_container_app
 from vital_agent_container.agent_container_app import AgentContainerApp
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
 
@@ -106,6 +107,24 @@ async def close_signal_then_raise(ws, started):
         await ws.send_text("reply")
         await ws.close()
         started.set()
+
+
+post_close_done = threading.Event()
+
+
+async def close_signal_then_short_work(ws, started):
+    await ws.send_text("reply")
+    await ws.close()
+    started.set()
+    await asyncio.sleep(0.1)  # e.g. persisting after the reply
+    post_close_done.set()
+
+
+async def close_signal_then_hang(ws, started):
+    await ws.send_text("reply")
+    await ws.close()
+    started.set()
+    await asyncio.Event().wait()
 
 
 async def hang_swallowing_cancel(ws, started):
@@ -324,6 +343,57 @@ def test_failed_task_is_logged_when_handler_closed_the_socket(logs):
     failed = [m for m in errors(logs) if "Handler task failed" in m]
     assert len(failed) == 1 and "handler blew up" in failed[0]
     assert not any(NOT_CONNECTED in m or "communication error" in m for m in errors(logs))
+
+
+# ── Close grace period ───────────────────────────────────────
+
+def test_post_close_work_within_grace_completes(logs):
+    post_close_done.clear()
+    app, handler = make_app(close_signal_then_short_work)
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_text(_message("disabled"))
+        assert ws.receive_text() == "reply"
+        assert receive_close(ws)[0] == 1000
+        wait_done(app)
+
+    assert post_close_done.is_set()
+    assert errors(logs) == []
+
+
+def test_post_close_work_beyond_grace_is_cancelled(logs, monkeypatch):
+    monkeypatch.setattr(agent_container_app, "SERVER_CLOSE_GRACE_SECONDS", 0.2)
+    app, handler = make_app(close_signal_then_hang)
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_text(_message("disabled"))
+        assert ws.receive_text() == "reply"
+        assert receive_close(ws)[0] == 1000
+        wait_done(app)
+
+    assert handler.finally_ran.is_set()
+    # AIMPMessageProcessor logs every cancellation as "Canceling" at ERROR (pre-existing)
+    assert [m for m in errors(logs) if not m.startswith("Canceling")] == []
+
+
+async def test_cancel_during_grace_wait_still_cleans_up():
+    app, _ = make_app(reply_only)
+    websocket = MagicMock()
+    websocket.application_state = WebSocketState.DISCONNECTED  # loop exits as "closed by server"
+    websocket.client_state = WebSocketState.DISCONNECTED
+
+    async def cancelled_grace(background_tasks):
+        raise asyncio.CancelledError  # server shutting down mid-wait
+
+    cleaned_up = []
+
+    async def cleanup(*args, **kwargs):
+        cleaned_up.append(True)
+
+    with patch.object(app, "_let_closing_tasks_finish", cancelled_grace), \
+            patch.object(app, "_cleanup_websocket_resources", cleanup):
+        with pytest.raises(asyncio.CancelledError):
+            await app._run_receive_loop(websocket, "test", get_jwt=None)
+
+    assert cleaned_up == [True]
 
 
 # ── Gap 2: idle timeout ──────────────────────────────────────

@@ -94,6 +94,12 @@ app = AgentContainerApp(handler, app_config=config)
 A connection can carry any number of messages, one at a time. Either side may close the
 connection. A handler that closes the socket when it's done is a normal end and is logged at INFO.
 
+When a handler closes the socket, the connection ends. A handler that keeps working after
+`close()` (persisting, logging, other cleanup) gets **5 seconds** to finish. After that it's
+cancelled. Do slow post-close work in a separate task you manage yourself. The 5s grace period is a
+fixed constant (`SERVER_CLOSE_GRACE_SECONDS` in `agent_container_app.py`), not configurable like the
+timeouts below.
+
 The container doesn't read the next message until the handler sets `started_event`. When the
 handler sets it decides what happens next:
 
