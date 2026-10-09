@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 import jwt
 import pytest
 from starlette.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect, WebSocketState
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from vital_agent_container import agent_container_app
 from vital_agent_container.agent_container_app import AgentContainerApp
@@ -117,6 +117,26 @@ async def close_signal_then_short_work(ws, started):
     await ws.close()
     started.set()
     await asyncio.sleep(0.1)  # e.g. persisting after the reply
+    post_close_done.set()
+
+
+receive_text_calls = []
+
+
+async def signal_close_then_short_work(ws, started):
+    """Early-signalling handler: the loop is reading while it closes, so the
+    client's reply to our close arrives as a disconnect."""
+    started.set()
+    # Wait until the loop is inside its second receive_text() (needs the spy below)
+    for _ in range(1000):
+        if len(receive_text_calls) >= 2:
+            break
+        await asyncio.sleep(0.002)
+    else:
+        raise AssertionError("receive loop never re-entered receive_text()")
+    await ws.send_text("reply")
+    await ws.close()
+    await asyncio.sleep(0.1)
     post_close_done.set()
 
 
@@ -356,6 +376,34 @@ def test_post_close_work_within_grace_completes(logs):
         assert receive_close(ws)[0] == 1000
         wait_done(app)
 
+    assert post_close_done.is_set()
+    assert errors(logs) == []
+
+
+def test_post_close_work_within_grace_completes_for_early_signal(logs, monkeypatch):
+    post_close_done.clear()
+    receive_text_calls.clear()
+    disconnect_raised = threading.Event()
+    original_receive_text = WebSocket.receive_text
+
+    async def spy_receive_text(self):
+        receive_text_calls.append(True)  # counted before the state check, which is synchronous
+        try:
+            return await original_receive_text(self)
+        except WebSocketDisconnect:
+            disconnect_raised.set()
+            raise
+
+    monkeypatch.setattr(WebSocket, "receive_text", spy_receive_text)
+    app, handler = make_app(signal_close_then_short_work)
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_text(_message("disabled"))
+        assert ws.receive_text() == "reply"
+        assert receive_close(ws)[0] == 1000
+        ws.close()  # the client answers our close with a disconnect
+        wait_done(app)
+
+    assert disconnect_raised.is_set(), "loop did not exit via WebSocketDisconnect"
     assert post_close_done.is_set()
     assert errors(logs) == []
 

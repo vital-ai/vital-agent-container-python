@@ -392,7 +392,12 @@ class AgentContainerApp(FastAPI):
                 logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
 
         except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected normally for {client_info} after {message_count} messages")
+            if websocket.application_state == WebSocketState.DISCONNECTED:
+                # Our side closed first; this is the client answering our close
+                closed_by_server = True
+                logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
+            else:
+                logger.info(f"WebSocket disconnected normally for {client_info} after {message_count} messages")
         except RuntimeError as e:
             # Starlette raises RuntimeError (not WebSocketDisconnect) when reading a socket
             # that our side already closed, e.g. a handler closing between our check and read
