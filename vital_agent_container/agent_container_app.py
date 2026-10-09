@@ -13,10 +13,11 @@ from dotenv import load_dotenv
 from dataclasses import dataclass
 from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from vital_agent_container.connection import AgentConnection, ConnectionClosed
+from starlette.datastructures import State
+from vital_agent_container.connection import AgentConnection, ConnectionClosed, _Channel
 from vital_agent_container.protocol import (
-    CloseCode, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE,
-    ERROR_BUSY, STATUS_IDLE, STATUS_INTERRUPTED, control_error, control_status,
+    CloseCode, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE, URI_PROPERTY,
+    ERROR_BUSY, STATUS_DONE, STATUS_IDLE, STATUS_INTERRUPTED, control_error, control_status,
 )
 from vital_agent_container.tasks.task_manager_async_client import TaskManagerAsyncClient
 from vital_agent_container.utils.aws_utils import AWSUtils
@@ -65,6 +66,7 @@ class _HandlerRun:
     """One running handler invocation."""
     task: asyncio.Task
     client: TaskManagerAsyncClient
+    connection: AgentConnection
     started_at: float
 
     def remaining(self, timeout: Optional[float]) -> Optional[float]:
@@ -329,12 +331,14 @@ class AgentContainerApp(FastAPI):
         """Run one accepted connection (see README "WebSocket protocol").
 
         The loop always reads, so interrupts, close requests and busy rejections work while a
-        handler runs, and it is the only place the socket is closed. get_jwt(data) returns
-        (jwt_payload, jwt_token) for a message, or raises _ConnectionRejected.
+        handler runs, and it is the only place the socket is closed. Every interaction ends with
+        exactly one of: an `sdk.status done`, an `sdk.status interrupted`, or a close code.
+        get_jwt(data) returns (jwt_payload, jwt_token) for a message, or raises _ConnectionRejected.
         """
-        connection = AgentConnection(websocket, client_info)
+        channel = _Channel(websocket)
         receive_task = None
         run: Optional[_HandlerRun] = None
+        unwinding = set()  # interrupted runs unwinding in the background
         client_close_requested = False
         message_count = 0
         # Close used when the loop ends; overwritten by each normal way of ending
@@ -356,26 +360,29 @@ class AgentContainerApp(FastAPI):
                     else:
                         logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelling")
                         close_code, close_reason = CloseCode.HANDLER_TIMEOUT, "Handler timeout"
-                        # Close before cancelling, so the client sees 4008 whatever the handler's cleanup does
-                        await connection._close(close_code, close_reason)
+                        # Close before cancelling, so the client sees 4008 whatever the handler's
+                        # cleanup does; bounded even if a handler send is stuck
+                        run.connection._end()
+                        await channel.close(close_code, close_reason)
                     break
 
                 if run is not None and run.task in done:
                     finished, run = run, None
                     error = await self._finish_run(finished, client_info)
                     if error is not None:
-                        if isinstance(error, ConnectionClosed) or not connection.is_open:
+                        if isinstance(error, ConnectionClosed) or not channel.is_open:
                             logger.info(f"Handler for {client_info} stopped: connection has ended")
                         else:
                             logger.error(f"Handler failed for {client_info}: {error!r}")
                             close_code, close_reason = CloseCode.INTERNAL_ERROR, "Handler error"
                         break
-                    if connection.close_requested:
+                    if finished.connection.close_requested:
                         close_code, close_reason = CloseCode.NORMAL, "Closed by service"
                         break
                     if client_close_requested:
                         close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
                         break
+                    await self._send_control(channel, control_status(STATUS_DONE, finished.connection.request_uri))
 
                 if receive_task in done:
                     finished_receive, receive_task = receive_task, None
@@ -388,7 +395,9 @@ class AgentContainerApp(FastAPI):
                     jwt_payload, jwt_token = await get_jwt(data)
 
                     try:
-                        intent = json.loads(data)[0].get(INTENT_PROPERTY)
+                        first = json.loads(data)[0]
+                        intent = first.get(INTENT_PROPERTY)
+                        uri = first.get(URI_PROPERTY)
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON from {client_info}")
                         close_code, close_reason = CloseCode.UNSUPPORTED_DATA, "Invalid JSON"
@@ -400,12 +409,18 @@ class AgentContainerApp(FastAPI):
 
                     if intent == INTENT_INTERRUPT:
                         if run is None:
-                            await connection.send_json(control_status(STATUS_IDLE))
+                            await self._send_control(channel, control_status(STATUS_IDLE, uri))
                         else:
                             logger.info(f"Interrupt from {client_info}; cancelling handler")
                             interrupted, run = run, None
-                            await self._cancel_run(interrupted, client_info)
-                            await connection.send_json(control_status(STATUS_INTERRUPTED))
+                            # The interrupted run can no longer send, so it may unwind in the
+                            # background while the loop keeps reading
+                            interrupted.connection._end()
+                            unwind = asyncio.create_task(self._cancel_run(interrupted, client_info))
+                            unwinding.add(unwind)
+                            unwind.add_done_callback(unwinding.discard)
+                            await self._send_control(
+                                channel, control_status(STATUS_INTERRUPTED, interrupted.connection.request_uri))
                     elif intent == INTENT_CLOSE:
                         if run is None:
                             close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
@@ -414,10 +429,11 @@ class AgentContainerApp(FastAPI):
                         client_close_requested = True
                     elif run is not None:
                         logger.info(f"Busy: rejecting message #{message_count} from {client_info}")
-                        await connection.send_json(control_error(ERROR_BUSY, "a message is already being processed"))
+                        await self._send_control(
+                            channel, control_error(ERROR_BUSY, "a message is already being processed", uri))
                     else:
                         logger.info(f"Processing message #{message_count} for {client_info}")
-                        run = self._start_run(connection, data, jwt_payload, jwt_token)
+                        run = self._start_run(channel, websocket, client_info, data, uri, jwt_payload, jwt_token)
 
         except (WebSocketDisconnect, ConnectionClosed):
             logger.info(f"Client {client_info} disconnected after {message_count} messages")
@@ -433,12 +449,23 @@ class AgentContainerApp(FastAPI):
             try:
                 if run is not None:
                     await self._cancel_run(run, client_info)
+                if unwinding:
+                    await asyncio.wait(set(unwinding))  # each is bounded by the unwind grace
             finally:
-                if connection.is_open:
+                if channel.is_open:
                     logger.info(f"Closing connection for {client_info}: {int(close_code)} {close_reason}")
-                await connection._close(close_code, close_reason)
+                await channel.close(close_code, close_reason)
 
-    def _start_run(self, connection: AgentConnection, data: str, jwt_payload, jwt_token) -> _HandlerRun:
+    @staticmethod
+    async def _send_control(channel: _Channel, message: dict):
+        await channel.send_text(json.dumps(message))
+
+    def _start_run(self, channel: _Channel, websocket: WebSocket, client_info: str, data: str,
+                   request_uri, jwt_payload, jwt_token) -> _HandlerRun:
+        # Snapshot connection state for this run, so later messages (busy, interrupt, close)
+        # can't change what a running handler sees
+        state = State(dict(getattr(websocket.state, "_state", {})))
+        connection = AgentConnection(channel, client_info, state=state, request_uri=request_uri)
         client = TaskManagerAsyncClient()
         task = asyncio.create_task(self.message_processor.process_message(
             handler=self.handler,
@@ -449,15 +476,18 @@ class AgentContainerApp(FastAPI):
             jwt_payload=jwt_payload,
             jwt_token=jwt_token
         ))
-        return _HandlerRun(task=task, client=client, started_at=asyncio.get_running_loop().time())
+        return _HandlerRun(task=task, client=client, connection=connection,
+                           started_at=asyncio.get_running_loop().time())
 
     async def _finish_run(self, run: _HandlerRun, client_info: str) -> Optional[BaseException]:
         """Release a finished run's resources; return the exception it raised, if any."""
+        run.connection._end()
         await self._close_client(run.client, client_info)
         return None if run.task.cancelled() else run.task.exception()
 
     async def _cancel_run(self, run: _HandlerRun, client_info: str):
         """Cancel a handler and give it HANDLER_UNWIND_GRACE_SECONDS to unwind, then abandon it."""
+        run.connection._end()
         run.task.cancel()
         try:
             await run.client.cancel_current_tasks()

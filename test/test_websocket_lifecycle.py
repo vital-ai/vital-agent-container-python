@@ -113,6 +113,33 @@ async def raise_own_timeout(connection, data):
 
 
 slow_unwind_done = threading.Event()
+late_send_results = []
+
+
+async def slow_unwind_then_late_send(connection, data):
+    """On "hang": swallow the interrupt, keep working, then try to send. Otherwise reply."""
+    if "hang" not in data:
+        await connection.send_text("reply")
+        return
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await asyncio.sleep(0.5)
+        try:
+            await connection.send_text("late")
+            late_send_results.append("sent")
+        except ConnectionClosed:
+            late_send_results.append("ConnectionClosed")
+
+
+seen_subjects = []
+
+
+async def record_jwt_subject_over_time(connection, data):
+    seen_subjects.append(connection.state.jwt_payload["jwt_token"]["sub"])
+    await asyncio.sleep(0.3)  # other messages arrive meanwhile
+    seen_subjects.append(connection.state.jwt_payload["jwt_token"]["sub"])
+    await connection.send_text("reply")
 
 
 async def hang_then_slow_unwind(connection, data):
@@ -149,12 +176,12 @@ def _connect_kwargs(mode):
     return {}
 
 
-def _message(mode="disabled", intent=None, text="hello", jwt_in_payload=True):
-    obj = {"type": "test", "text": text}
+def _message(mode="disabled", intent=None, text="hello", jwt_in_payload=True, uri="urn:test:msg", sub="test-user"):
+    obj = {"type": "test", "text": text, "URI": uri}
     if intent:
         obj["http://vital.ai/ontology/vital-aimp#hasIntent"] = intent
     if mode == "payload" and jwt_in_payload:
-        obj["http://vital.ai/ontology/vital-aimp#hasJwtJSON"] = json.dumps({"jwt_token": _token()})
+        obj["http://vital.ai/ontology/vital-aimp#hasJwtJSON"] = json.dumps({"jwt_token": _token(sub)})
     return json.dumps([obj])
 
 
@@ -183,6 +210,10 @@ def receive_control(ws):
     msg = json.loads(ws.receive_text())
     assert isinstance(msg, dict), msg
     return msg
+
+
+def expect_done(ws, uri="urn:test:msg"):
+    assert receive_control(ws) == {"type": "sdk.status", "status": "done", "in_reply_to": uri}
 
 
 @pytest.fixture
@@ -222,6 +253,7 @@ def test_client_close_intent_when_idle_closes_1000(logs, mode):
     with connect(app, mode) as ws:
         ws.send_text(_message(mode))
         assert ws.receive_text() == "reply"
+        expect_done(ws)
         ws.send_text(_message(mode, intent="close"))
         assert receive_close(ws) == (CloseCode.NORMAL, "Closed by client request")
         wait_done(app)
@@ -244,9 +276,10 @@ def test_client_close_intent_while_running_waits_for_handler(logs):
 def test_handler_finishing_does_not_close_the_connection(logs):
     app, handler = make_app(reply)
     with connect(app) as ws:
-        for _ in range(3):
-            ws.send_text(_message())
+        for i in range(3):
+            ws.send_text(_message(uri=f"urn:test:msg-{i}"))
             assert ws.receive_text() == "reply"
+            expect_done(ws, f"urn:test:msg-{i}")  # each interaction ends with done
         ws.send_text(_message(intent="close"))
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
@@ -283,11 +316,13 @@ def test_client_disconnect_while_idle(logs):
 def test_message_while_running_gets_busy_control_message(logs):
     app, handler = make_app(slow_reply)
     with connect(app) as ws:
-        ws.send_text(_message())
-        ws.send_text(_message())
+        ws.send_text(_message(uri="urn:test:first"))
+        ws.send_text(_message(uri="urn:test:second"))
         assert receive_control(ws) == {"type": "sdk.error", "error": "busy",
-                                       "detail": "a message is already being processed"}
+                                       "detail": "a message is already being processed",
+                                       "in_reply_to": "urn:test:second"}
         assert ws.receive_text() == "reply"
+        expect_done(ws, "urn:test:first")
         ws.send_text(_message(intent="close"))
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
@@ -299,13 +334,16 @@ def test_message_while_running_gets_busy_control_message(logs):
 def test_interrupt_cancels_handler_and_keeps_connection_open(logs, mode):
     app, handler = make_app(hang_if_asked, mode)
     with connect(app, mode) as ws:
-        ws.send_text(_message(mode, text="hang"))
-        ws.send_text(_message(mode, intent="interrupt"))
-        assert receive_control(ws) == {"type": "sdk.status", "status": "interrupted"}
-        assert handler.finally_ran.is_set()
+        ws.send_text(_message(mode, text="hang", uri="urn:test:long"))
+        ws.send_text(_message(mode, intent="interrupt", uri="urn:test:interrupt"))
+        # in_reply_to names the interaction that ended
+        assert receive_control(ws) == {"type": "sdk.status", "status": "interrupted",
+                                       "in_reply_to": "urn:test:long"}
+        assert handler.finally_ran.wait(2)
 
         ws.send_text(_message(mode))  # the connection is still usable
         assert ws.receive_text() == "reply"
+        expect_done(ws)
         ws.send_text(_message(mode, intent="close"))
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
@@ -313,11 +351,55 @@ def test_interrupt_cancels_handler_and_keeps_connection_open(logs, mode):
     assert errors(logs) == []
 
 
+def test_interrupt_unwinds_in_background_and_blocks_late_sends(logs):
+    """The loop keeps reading while an interrupted handler unwinds, and the interrupted run can't
+    send into the next interaction."""
+    late_send_results.clear()
+    app, _ = make_app(slow_unwind_then_late_send)
+    with connect(app) as ws:
+        ws.send_text(_message(text="hang", uri="urn:test:long"))
+        ws.send_text(_message(intent="interrupt"))
+        assert receive_control(ws)["status"] == "interrupted"
+
+        # Served while the interrupted handler is still unwinding (0.5s)
+        ws.send_text(_message(uri="urn:test:next"))
+        assert ws.receive_text() == "reply"
+        expect_done(ws, "urn:test:next")
+        assert late_send_results == []  # the old handler hasn't tried yet
+
+        for _ in range(200):
+            if late_send_results:
+                break
+            threading.Event().wait(0.01)
+        assert late_send_results == ["ConnectionClosed"]
+
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL  # no "late" frame arrived first
+        wait_done(app)
+
+
+def test_payload_mode_run_state_is_not_changed_by_later_messages(logs):
+    seen_subjects.clear()
+    app, _ = make_app(record_jwt_subject_over_time, "payload")
+    with connect(app, "payload") as ws:
+        ws.send_text(_message("payload", sub="alice", uri="urn:test:first"))
+        ws.send_text(_message("payload", sub="bob", uri="urn:test:second"))  # busy, but carries a JWT
+        assert receive_control(ws)["error"] == "busy"
+        assert ws.receive_text() == "reply"
+        expect_done(ws, "urn:test:first")
+        ws.send_text(_message("payload", intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    assert seen_subjects == ["alice", "alice"]
+
+
 def test_interrupt_while_idle_reports_idle(logs):
     app, handler = make_app(reply)
     with connect(app) as ws:
-        ws.send_text(_message(intent="interrupt"))
-        assert receive_control(ws) == {"type": "sdk.status", "status": "idle"}
+        ws.send_text(_message(intent="interrupt", uri="urn:test:interrupt"))
+        assert receive_control(ws) == {"type": "sdk.status", "status": "idle",
+                                       "in_reply_to": "urn:test:interrupt"}
         ws.send_text(_message(intent="close"))
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
@@ -415,6 +497,7 @@ def test_idle_timer_does_not_run_while_handler_runs(logs):
     with connect(app) as ws:
         ws.send_text(_message())
         assert ws.receive_text() == "reply"  # the 0.4s handler outlived the 0.2s idle timeout
+        expect_done(ws)
         assert receive_close(ws) == (CloseCode.NORMAL, "Idle timeout")
         wait_done(app)
 
@@ -473,6 +556,7 @@ def test_deadline_disabled_with_zero(logs):
     with connect(app) as ws:
         ws.send_text(_message())
         assert ws.receive_text() == "reply"
+        expect_done(ws)
         ws.send_text(_message(intent="close"))
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
@@ -492,7 +576,8 @@ class FakeWebSocket:
             self._messages.put_nowait(m)
         self.sent = []
         self.closed_with = None
-        self.state = type("State", (), {})()
+        from starlette.datastructures import State
+        self.state = State()
 
     async def receive_text(self):
         return await self._messages.get()  # blocks once the scripted messages run out
@@ -504,6 +589,33 @@ class FakeWebSocket:
         from starlette.websockets import WebSocketState
         self.application_state = WebSocketState.DISCONNECTED
         self.closed_with = (code, reason)
+
+
+async def test_deadline_close_is_not_blocked_by_a_stuck_send(monkeypatch):
+    """A handler stuck sending to a client that stopped reading can't hold up the 4008 close."""
+    from vital_agent_container import connection as connection_module
+    monkeypatch.setattr(connection_module, "SEND_LOCK_WAIT_ON_CLOSE_SECONDS", 0.1)
+    send_started = asyncio.Event()
+
+    async def send_forever(connection, data):
+        await connection.send_text("stuck")
+
+    app, handler = make_app(send_forever, ws_task_timeout=0.2)
+    websocket = FakeWebSocket([_message()])
+
+    async def stuck_send(text):
+        send_started.set()
+        await asyncio.Event().wait()  # the client never drains
+
+    websocket.send_text = stuck_send
+
+    async def no_jwt(data):
+        return None, None
+
+    await asyncio.wait_for(app._run_connection(websocket, "test", no_jwt), timeout=3)
+    assert send_started.is_set()
+    assert websocket.closed_with == (CloseCode.HANDLER_TIMEOUT, "Handler timeout")
+    assert handler.finally_ran.is_set()
 
 
 async def test_shutdown_cancels_handler_and_closes_1001():

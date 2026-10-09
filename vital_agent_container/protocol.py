@@ -3,7 +3,7 @@
 See README "WebSocket protocol". Close codes are the contract; reason strings are informational.
 """
 from enum import IntEnum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 # Intents a client can put on the first AIMP object of a message
@@ -26,13 +26,17 @@ CONTROL_ERROR = "sdk.error"
 CONTROL_STATUS = "sdk.status"
 
 ERROR_BUSY = "busy"
+STATUS_DONE = "done"
 STATUS_INTERRUPTED = "interrupted"
 STATUS_IDLE = "idle"
 
+# AIMP objects carry their URI under this key; control messages echo the request's URI
+URI_PROPERTY = "URI"
 
-def control_error(error: str, detail: str) -> Dict[str, Any]:
-    return {"type": CONTROL_ERROR, "error": error, "detail": detail}
+
+def control_error(error: str, detail: str, in_reply_to: Optional[str] = None) -> Dict[str, Any]:
+    return {"type": CONTROL_ERROR, "error": error, "detail": detail, "in_reply_to": in_reply_to}
 
 
-def control_status(status: str) -> Dict[str, Any]:
-    return {"type": CONTROL_STATUS, "status": status}
+def control_status(status: str, in_reply_to: Optional[str] = None) -> Dict[str, Any]:
+    return {"type": CONTROL_STATUS, "status": status, "in_reply_to": in_reply_to}

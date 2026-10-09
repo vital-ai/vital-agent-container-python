@@ -101,16 +101,33 @@ and the container does the actual close.
 - **The client ends it** by sending a message whose first object has
   `"http://vital.ai/ontology/vital-aimp#hasIntent": "close"`. A running handler finishes first.
   A plain WebSocket close or disconnect from the client cancels a running handler immediately.
+- **Every interaction ends with exactly one terminal signal:** an `sdk.status` `done` (the handler
+  returned; the connection stays open), an `sdk.status` `interrupted`, or a close code. Until one
+  arrives, more replies may follow.
 - **The container always reads**, even while a handler runs:
 
 | Client sends | No handler running | Handler running |
 |---|---|---|
-| an AIMP message (JSON list) | starts the handler | rejected: `{"type": "sdk.error", "error": "busy", ...}` |
-| intent `interrupt` | `{"type": "sdk.status", "status": "idle"}` | cancels the handler, then `{"type": "sdk.status", "status": "interrupted"}`; the connection stays open |
-| intent `close` | close 1000 | close 1000 after the handler returns |
+| an AIMP message (JSON list) | starts the handler; when it returns: `done`, or close 1000 if it called `request_close()` | rejected with `busy` |
+| intent `interrupt` | `idle` | `interrupted` (the handler is cancelled); the connection stays open |
+| intent `close` | close 1000 | close 1000 after the handler returns (no `done`) |
 | invalid JSON / not an AIMP list | close 1003 | close 1003 (handler cancelled) |
 
-Container control messages are JSON **objects**; AIMP payloads are JSON **lists**.
+Control messages are JSON **objects**; AIMP payloads are JSON **lists**. `in_reply_to` is the `URI`
+of the request's first AIMP object (`null` if it has none). For `done` and `interrupted` that is the
+interaction that ended. For `busy` and `idle` it's the message being answered.
+
+```json
+{"type": "sdk.status", "status": "done",        "in_reply_to": "urn:..."}
+{"type": "sdk.status", "status": "interrupted", "in_reply_to": "urn:..."}
+{"type": "sdk.status", "status": "idle",        "in_reply_to": "urn:..."}
+{"type": "sdk.error",  "error": "busy", "detail": "a message is already being processed", "in_reply_to": "urn:..."}
+```
+
+**Messages after a close request aren't processed.** Once the handler has called
+`request_close()` and returned, the connection closes. A message that arrives at the same moment is
+dropped without a reply. Clients shouldn't send after the service may have ended the interaction
+with a close request; wait for `done` first.
 
 **JWT enforcement is unchanged by this protocol.** Header mode validates the token before the
 connection is accepted. Payload mode checks the JWT on **every** message, including `interrupt` and
@@ -131,14 +148,21 @@ informational.
 
 **Handler rules:**
 
-- Send with `await connection.send_text(...)` / `send_json(...)`. Once the connection has ended
-  (client left, timeout, interrupt cleanup), sends raise `ConnectionClosed`.
+- Send with `await connection.send_text(...)` / `send_json(...)`. The `connection` belongs to one
+  run. Once that run is over (returned, interrupted, timed out) or the connection has ended, its
+  sends raise `ConnectionClosed`. So a handler can't send into a later interaction, including from
+  background tasks it started.
+- `connection.state` is a snapshot taken when the run starts (JWT payload/tokens etc.). Messages
+  that arrive during the run don't change it.
 - Return when the interaction is done. Call `connection.request_close()` first if the connection
   should end.
 - A cancelled handler (interrupt, client disconnect, deadline, shutdown) gets 5 seconds
   (`HANDLER_UNWIND_GRACE_SECONDS`) to unwind. After that it's logged at ERROR and abandoned. It keeps
   running in the background until it finishes. Don't catch `CancelledError` to keep working.
-- On the deadline the container closes with 4008 *before* cancelling the handler. A handler can't
+  After an interrupt the unwind happens in the background. `interrupted` is sent at once, and the
+  next message can start a new run while the old one is still unwinding.
+- On the deadline the container closes with 4008 *before* cancelling the handler, even if a handler
+  send is stuck (it waits at most 1s for it). A handler can't
   replace that with its own reply, so enforce a shorter deadline in the handler if you want to answer
   timeouts yourself.
 
