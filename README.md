@@ -113,6 +113,10 @@ and the container does the actual close.
 | intent `close` | close 1000 | close 1000 after the handler returns (no `done`) |
 | invalid JSON / not an AIMP list | close 1003 | close 1003 (handler cancelled) |
 
+**Two kinds of rejection, two client reactions.** After `busy`, wait for the running
+interaction's `done` or `interrupted`. Both are guaranteed to arrive. After `cancelling`, wait for
+`ready`, which is sent exactly once when a request would be accepted again.
+
 Control messages are JSON **objects**; AIMP payloads are JSON **lists**. `in_reply_to` is the `URI`
 of the request's first AIMP object (`null` if it has none). For `done` and `interrupted` that is the
 interaction that ended. For `busy` and `idle` it's the message being answered.
@@ -122,6 +126,8 @@ interaction that ended. For `busy` and `idle` it's the message being answered.
 {"type": "sdk.status", "status": "interrupted", "in_reply_to": "urn:..."}
 {"type": "sdk.status", "status": "idle",        "in_reply_to": "urn:..."}
 {"type": "sdk.error",  "error": "busy", "detail": "a message is already being processed", "in_reply_to": "urn:..."}
+{"type": "sdk.error",  "error": "cancelling", "detail": "previous requests are still being cancelled", "in_reply_to": "urn:..."}
+{"type": "sdk.status", "status": "ready",       "in_reply_to": null}
 ```
 
 **Messages after a close request aren't processed.** Once the handler has called
@@ -162,9 +168,10 @@ informational.
   After an interrupt the unwind happens in the background. `interrupted` is sent at once, and the
   next message can start a new run while the old one is still unwinding. A connection may have at
   most **one** interrupted handler still running alongside a new one. Beyond that, new requests get
-  `busy` (`"previous requests are still being cancelled"`) until an interrupted handler finishes,
-  including abandoned ones. A handler that ignores cancellation therefore holds up its own
-  connection, not the process.
+  `sdk.error cancelling` until an interrupted handler finishes (abandoned ones included). Then the
+  container sends **one** `sdk.status ready`, and requests are accepted again. A handler that ignores
+  cancellation therefore holds up its own connection, not the process. The cap is per connection;
+  abandoned handlers across the process are only logged, with a running count.
 - On the deadline the container closes with 4008 *before* cancelling the handler, even if a handler
   send is stuck (it waits at most 1s for it). A handler can't
   replace that with its own reply, so enforce a shorter deadline in the handler if you want to answer

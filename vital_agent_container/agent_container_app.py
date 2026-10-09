@@ -17,7 +17,8 @@ from starlette.datastructures import State
 from vital_agent_container.connection import AgentConnection, ConnectionClosed, _Channel
 from vital_agent_container.protocol import (
     CloseCode, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE, URI_PROPERTY,
-    ERROR_BUSY, STATUS_DONE, STATUS_IDLE, STATUS_INTERRUPTED, control_error, control_status,
+    ERROR_BUSY, ERROR_CANCELLING, STATUS_DONE, STATUS_IDLE, STATUS_INTERRUPTED, STATUS_READY,
+    control_error, control_status,
 )
 from vital_agent_container.tasks.task_manager_async_client import TaskManagerAsyncClient
 from vital_agent_container.utils.aws_utils import AWSUtils
@@ -347,6 +348,7 @@ class AgentContainerApp(FastAPI):
         run: Optional[_HandlerRun] = None
         unwinding = set()  # unwind tasks for interrupted runs (each bounded by the grace period)
         lingering = set()  # interrupted handler tasks not yet finished, abandoned ones included
+        owe_ready = False  # a request was refused as "cancelling"; send "ready" once accepted again
         client_close_requested = False
         message_count = 0
         # Close used when the loop ends; overwritten by each normal way of ending
@@ -357,6 +359,8 @@ class AgentContainerApp(FastAPI):
                 if receive_task is None:
                     receive_task = asyncio.ensure_future(websocket.receive_text())
                 waiting = {receive_task} if run is None else {receive_task, run.task}
+                if owe_ready:
+                    waiting |= lingering  # wake when an interrupted handler finishes
                 # Idle timer only while no handler runs; otherwise the handler's deadline
                 timeout = self.ws_idle_timeout if run is None else run.remaining(self.ws_task_timeout)
                 done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
@@ -373,6 +377,10 @@ class AgentContainerApp(FastAPI):
                         run.connection._end()
                         await channel.close(close_code, close_reason)
                     break
+
+                if owe_ready and len(lingering) <= MAX_LINGERING_HANDLERS_PER_CONNECTION:
+                    owe_ready = False
+                    await self._send_control(channel, control_status(STATUS_READY))
 
                 if run is not None and run.task in done:
                     finished, run = run, None
@@ -443,10 +451,11 @@ class AgentContainerApp(FastAPI):
                             channel, control_error(ERROR_BUSY, "a message is already being processed", uri))
                     elif len(lingering) > MAX_LINGERING_HANDLERS_PER_CONNECTION:
                         # Interrupt-then-resend may overlap one cancelled handler, not any number
-                        logger.info(f"Busy: rejecting message #{message_count} from {client_info}; "
+                        logger.info(f"Cancelling: rejecting message #{message_count} from {client_info}; "
                                     f"{len(lingering)} interrupted handlers still running")
+                        owe_ready = True
                         await self._send_control(
-                            channel, control_error(ERROR_BUSY, "previous requests are still being cancelled", uri))
+                            channel, control_error(ERROR_CANCELLING, "previous requests are still being cancelled", uri))
                     else:
                         logger.info(f"Processing message #{message_count} for {client_info}")
                         run = self._start_run(channel, websocket, client_info, data, uri, jwt_payload, jwt_token)

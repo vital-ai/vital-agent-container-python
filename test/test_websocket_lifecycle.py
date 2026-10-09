@@ -386,7 +386,8 @@ def test_interrupt_unwinds_in_background_and_blocks_late_sends(logs):
 
 
 def test_interrupted_handlers_are_capped_per_connection(logs):
-    """Interrupt-then-resend may overlap one cancelled handler, not any number."""
+    """Interrupt-then-resend may overlap one cancelled handler, not any number. Past the cap the
+    client gets "cancelling", then exactly one "ready" when requests are accepted again."""
     late_send_results.clear()
     app, handler = make_app(slow_unwind_then_late_send)  # interrupted handlers linger 0.5s
     with connect(app) as ws:
@@ -399,18 +400,17 @@ def test_interrupted_handlers_are_capped_per_connection(logs):
         ws.send_text(_message(intent="interrupt"))
         assert receive_control(ws)["in_reply_to"] == "urn:test:b"
 
-        # Two lingering handlers: further requests are refused until they finish
+        # Two lingering handlers: further requests are refused as "cancelling"
         ws.send_text(_message(uri="urn:test:c"))
-        assert receive_control(ws) == {"type": "sdk.error", "error": "busy",
+        assert receive_control(ws) == {"type": "sdk.error", "error": "cancelling",
                                        "detail": "previous requests are still being cancelled",
                                        "in_reply_to": "urn:test:c"}
+        ws.send_text(_message(uri="urn:test:c2"))  # still refused, still one "ready" owed
+        assert receive_control(ws)["error"] == "cancelling"
 
-        for _ in range(300):
-            if len(late_send_results) == 2:
-                break
-            threading.Event().wait(0.01)
-        assert late_send_results == ["ConnectionClosed", "ConnectionClosed"]
-        threading.Event().wait(0.05)  # let the loop see the handlers finish
+        # ...and told exactly once when requests are accepted again
+        assert receive_control(ws) == {"type": "sdk.status", "status": "ready", "in_reply_to": None}
+        assert "ConnectionClosed" in late_send_results  # an interrupted handler finished
 
         ws.send_text(_message(uri="urn:test:d"))
         assert ws.receive_text() == "reply"
@@ -419,7 +419,7 @@ def test_interrupted_handlers_are_capped_per_connection(logs):
         assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
 
-    assert handler.calls == 3  # a, b, d; c was refused
+    assert handler.calls == 3  # a, b, d; c and c2 were refused
 
 
 @pytest.mark.parametrize("mode", ["header", "payload"])

@@ -25,8 +25,10 @@ class CloseCode(IntEnum):
 CONTROL_ERROR = "sdk.error"
 CONTROL_STATUS = "sdk.status"
 
-ERROR_BUSY = "busy"
+ERROR_BUSY = "busy"              # a handler is running; wait for its done / interrupted
+ERROR_CANCELLING = "cancelling"  # interrupted handlers still running; wait for status ready
 STATUS_DONE = "done"
+STATUS_READY = "ready"           # sent after a cancelling rejection, once requests are accepted again
 STATUS_INTERRUPTED = "interrupted"
 STATUS_IDLE = "idle"
 
