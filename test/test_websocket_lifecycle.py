@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 import jwt
@@ -17,7 +18,7 @@ from vital_agent_container import agent_container_app
 from vital_agent_container.agent_container_app import AgentContainerApp
 from vital_agent_container.connection import ConnectionClosed
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
-from vital_agent_container.protocol import CloseCode
+from vital_agent_container.protocol import SUBPROTOCOL, CloseCode
 
 
 LOGGER_NAME = "VitalAgentContainerLogger"
@@ -199,7 +200,7 @@ def make_app(behavior, mode="disabled", **timeouts):
 
 
 def connect(app, mode="disabled"):
-    return TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode))
+    return TestClient(app).websocket_connect("/ws", subprotocols=[SUBPROTOCOL], **_connect_kwargs(mode))
 
 
 def wait_done(app, timeout=5):
@@ -458,6 +459,46 @@ def test_payload_mode_run_state_is_not_changed_by_later_messages(logs):
     assert seen_subjects == ["alice", "alice"]
 
 
+def test_close_then_interrupt_closes_after_interrupted(logs):
+    """V12: a pending close request is honoured when the run ends by interrupt."""
+    app, handler = make_app(hang_if_asked)
+    with connect(app) as ws:
+        ws.send_text(_message(text="hang", uri="urn:test:long"))
+        ws.send_text(_message(intent="close"))
+        ws.send_text(_message(intent="interrupt"))
+        assert receive_control(ws) == {"type": "sdk.status", "status": "interrupted",
+                                       "in_reply_to": "urn:test:long"}
+        assert receive_close(ws) == (CloseCode.NORMAL, "Closed by client request")
+        wait_done(app)
+
+    assert handler.calls == 1
+
+
+def test_close_is_not_delayed_by_handler_unwind(logs):
+    """V17: the close frame goes out before a running handler is cancelled and unwound."""
+    app, _ = make_app(hang_then_slow_unwind)  # swallows cancellation, unwinds for 1s
+    slow_unwind_done.clear()
+    with connect(app) as ws:
+        ws.send_text(_message(text="hang"))
+        started = time.monotonic()
+        ws.send_text("not json")
+        assert receive_close(ws) == (CloseCode.UNSUPPORTED_DATA, "Invalid JSON")
+        assert time.monotonic() - started < 0.5
+        wait_done(app)
+
+
+def test_binary_frame_closes_1003(logs):
+    """V7: binary frames are unsupported data, not an internal error."""
+    app, handler = make_app(reply)
+    with connect(app) as ws:
+        ws.send_bytes(b"\x00\x01")
+        assert receive_close(ws) == (CloseCode.UNSUPPORTED_DATA, "Binary frames not supported")
+        wait_done(app)
+
+    assert handler.calls == 0
+    assert errors(logs) == []
+
+
 def test_interrupt_while_idle_reports_idle(logs):
     app, handler = make_app(reply)
     with connect(app) as ws:
@@ -643,8 +684,9 @@ class FakeWebSocket:
         from starlette.datastructures import State
         self.state = State()
 
-    async def receive_text(self):
-        return await self._messages.get()  # blocks once the scripted messages run out
+    async def receive(self):
+        text = await self._messages.get()  # blocks once the scripted messages run out
+        return {"type": "websocket.receive", "text": text}
 
     async def send_text(self, text):
         self.sent.append(text)
@@ -700,6 +742,71 @@ async def test_send_waiting_for_the_lock_does_not_go_out_after_its_run_ends():
     assert websocket.sent == []
 
 
+async def test_control_send_cannot_stall_the_loop(monkeypatch):
+    """V18: a busy reply queued behind a stuck handler send times out instead of blocking the loop."""
+    from vital_agent_container import connection as connection_module
+    monkeypatch.setattr(agent_container_app, "CONTROL_SEND_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(connection_module, "SEND_LOCK_WAIT_ON_CLOSE_SECONDS", 0.1)
+
+    async def send_forever(connection, data):
+        await connection.send_text("stuck")
+
+    app, handler = make_app(send_forever, ws_task_timeout=30)
+    websocket = FakeWebSocket([_message(), _message()])  # the second one is answered with busy
+
+    async def stuck_send(text):
+        await asyncio.Event().wait()  # the client never drains
+
+    websocket.send_text = stuck_send
+
+    async def no_jwt(data):
+        return None, None
+
+    await asyncio.wait_for(app._run_connection(websocket, "test", no_jwt), timeout=3)
+    assert handler.finally_ran.is_set()
+    assert websocket.closed_with is not None
+
+
+class ClientRecordingHandler(AIMPMessageHandlerInf):
+    """Swallows cancellation and keeps running past the grace period; records its HTTP client."""
+
+    def __init__(self):
+        self.client = None
+        self.finished = asyncio.Event()
+
+    async def process_message(self, *, client, connection, data, **kwargs):
+        self.client = client
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.4)
+        finally:
+            self.finished.set()
+
+
+async def test_abandoned_handler_http_client_is_closed_when_it_finishes(monkeypatch):
+    """V13: no HTTP-client leak from abandoned handlers."""
+    monkeypatch.setattr(agent_container_app, "HANDLER_UNWIND_GRACE_SECONDS", 0.1)
+    handler = ClientRecordingHandler()
+    app = ObservedApp(handler, app_config={}, jwt_config={"enabled": False}, ws_task_timeout=0.1)
+    websocket = FakeWebSocket([_message()])
+
+    async def no_jwt(data):
+        return None, None
+
+    await asyncio.wait_for(app._run_connection(websocket, "test", no_jwt), timeout=3)
+    assert app._abandoned_tasks  # abandoned after the 0.1s grace
+    assert not handler.client.is_closed
+
+    await asyncio.wait_for(handler.finished.wait(), timeout=3)
+    for _ in range(100):
+        if handler.client.is_closed and not app._abandoned_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert handler.client.is_closed
+    assert not app._abandoned_tasks
+
+
 async def test_shutdown_cancels_handler_and_closes_1001():
     app, handler = make_app(hang)
     websocket = FakeWebSocket([_message()])
@@ -720,6 +827,44 @@ async def test_shutdown_cancels_handler_and_closes_1001():
     assert websocket.closed_with == (CloseCode.GOING_AWAY, "Server shutting down")
 
 
+# ── Subprotocol ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_connection_is_accepted_with_the_subprotocol(logs, mode):
+    app, _ = make_app(reply, mode)
+    with connect(app, mode) as ws:
+        assert ws.accepted_subprotocol == "vital-agent.v2"
+        ws.send_text(_message(mode, intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+
+@pytest.mark.parametrize("offered", [None, ["vital-agent.v1"]])
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_client_without_the_subprotocol_is_closed_4002(logs, mode, offered):
+    """A protocol mismatch fails at connect time with a readable code, in every JWT mode."""
+    app, handler = make_app(reply, mode)
+    kwargs = _connect_kwargs(mode)
+    if offered:
+        kwargs["subprotocols"] = offered
+    with TestClient(app).websocket_connect("/ws", **kwargs) as ws:
+        assert ws.accepted_subprotocol is None
+        assert receive_close(ws) == (CloseCode.UNSUPPORTED_PROTOCOL,
+                                     "Unsupported protocol; expected vital-agent.v2")
+    assert handler.calls == 0
+
+
+def test_header_mode_still_validates_jwt_before_the_protocol_check(logs):
+    """JWT handling is unchanged: a bad header token is rejected before accept, whatever the protocol."""
+    from starlette.websockets import WebSocketDisconnect
+    app, _ = make_app(reply, "header")
+    with pytest.raises(WebSocketDisconnect) as rejected:
+        with TestClient(app).websocket_connect("/ws", subprotocols=[SUBPROTOCOL],
+                                               headers={"authorization": "Bearer not-a-jwt"}):
+            pass
+    assert rejected.value.code == CloseCode.UNAUTHORIZED
+
+
 # ── Contract constants ───────────────────────────────────────
 
 def test_close_codes_are_stable():
@@ -729,6 +874,8 @@ def test_close_codes_are_stable():
     assert CloseCode.UNSUPPORTED_DATA == 1003
     assert CloseCode.INTERNAL_ERROR == 1011
     assert CloseCode.UNAUTHORIZED == 4001
+    assert CloseCode.UNSUPPORTED_PROTOCOL == 4002
+    assert SUBPROTOCOL == "vital-agent.v2"
     assert CloseCode.HANDLER_TIMEOUT == 4008
 
 

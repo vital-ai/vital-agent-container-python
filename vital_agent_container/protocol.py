@@ -6,6 +6,10 @@ from enum import IntEnum
 from typing import Any, Dict, Optional
 
 
+# WebSocket subprotocol a client must offer when connecting; the server accepts with it, and a
+# client should check it was selected (a pre-v2 server selects none)
+SUBPROTOCOL = "vital-agent.v2"
+
 # Intents a client can put on the first AIMP object of a message
 INTENT_PROPERTY = "http://vital.ai/ontology/vital-aimp#hasIntent"
 INTENT_INTERRUPT = "interrupt"
@@ -18,6 +22,7 @@ class CloseCode(IntEnum):
     UNSUPPORTED_DATA = 1003   # message is not valid JSON or not an AIMP message list
     INTERNAL_ERROR = 1011     # handler raised, or an unexpected SDK error
     UNAUTHORIZED = 4001       # JWT enforcement rejected the connection
+    UNSUPPORTED_PROTOCOL = 4002  # client did not offer SUBPROTOCOL
     HANDLER_TIMEOUT = 4008    # handler exceeded WS_TASK_TIMEOUT_SECONDS
 
 

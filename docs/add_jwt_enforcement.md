@@ -1,7 +1,7 @@
 # JWT Enforcement Plan for WebSocket Endpoint
 
 > **Historical design document.** The code snippets show the handler interface as it was at the
-> time (`websocket`, `started_event`). Since 0.1.19, handlers receive an `AgentConnection` and the
+> time (`websocket`, `started_event`). Since 0.2.0, handlers receive an `AgentConnection` and the
 > container owns the socket. See README "WebSocket protocol" for the current contract. The JWT
 > modes and the 4001 close code are unchanged.
 

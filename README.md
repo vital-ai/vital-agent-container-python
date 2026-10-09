@@ -94,6 +94,13 @@ app = AgentContainerApp(handler, app_config=config)
 The container owns the WebSocket. Handlers never close it: either side **signals** that it's done,
 and the container does the actual close.
 
+**Connecting.** Clients must offer the subprotocol **`vital-agent.v2`**
+(`vital_agent_container.protocol.SUBPROTOCOL`). The container accepts with it. A client that doesn't
+offer it is closed straight away with **4002** `Unsupported protocol`. Clients should also check that
+the server *selected* `vital-agent.v2`: a pre-v2 server selects none, and talking v2 to it would just
+hang. A mismatch therefore fails at connect time on either side. (In JWT header mode the token is
+still validated first; see below.)
+
 - **A connection carries any number of interactions, one at a time.** A handler finishing does not
   end the connection.
 - **The service ends it** with `connection.request_close()` in the handler. The container closes
@@ -111,15 +118,23 @@ and the container does the actual close.
 | an AIMP message (JSON list) | starts the handler; when it returns: `done`, or close 1000 if it called `request_close()` | rejected with `busy` |
 | intent `interrupt` | `idle` | `interrupted` (the handler is cancelled); the connection stays open |
 | intent `close` | close 1000 | close 1000 after the handler returns (no `done`) |
-| invalid JSON / not an AIMP list | close 1003 | close 1003 (handler cancelled) |
+| invalid JSON / not an AIMP list / a binary frame | close 1003 | close 1003 (handler cancelled) |
 
 **Two kinds of rejection, two client reactions.** After `busy`, wait for the running
 interaction's `done` or `interrupted`. Both are guaranteed to arrive. After `cancelling`, wait for
 `ready`, which is sent exactly once when a request would be accepted again.
 
-Control messages are JSON **objects**; AIMP payloads are JSON **lists**. `in_reply_to` is the `URI`
-of the request's first AIMP object (`null` if it has none). For `done` and `interrupted` that is the
-interaction that ended. For `busy` and `idle` it's the message being answered.
+Control messages are JSON **objects**; AIMP payloads are JSON **lists**. `in_reply_to` is a `URI`
+taken from a request's first AIMP object (`null` if it has none). **Which request it names depends
+on the message:**
+
+| Control message | `in_reply_to` names |
+|---|---|
+| `done` | the request whose interaction just ended |
+| `interrupted` | the **interrupted request**, not the `interrupt` message |
+| `idle` | the `interrupt` message itself (there was nothing to interrupt) |
+| `busy`, `cancelling` | the rejected message |
+| `ready` | nothing (`null`) |
 
 ```json
 {"type": "sdk.status", "status": "done",        "in_reply_to": "urn:..."}
@@ -135,6 +150,20 @@ interaction that ended. For `busy` and `idle` it's the message being answered.
 dropped without a reply. Clients shouldn't send after the service may have ended the interaction
 with a close request; wait for `done` first.
 
+**Races a client may see.** Both are harmless, and clients should accept them:
+
+- **`done` then `idle`:** the client sent `interrupt` just as the handler finished. The interaction
+  ended normally (`done`); the interrupt then found nothing to cancel (`idle`).
+- **`done` then a 1000 close:** the client sent `close` just as the handler finished. `done` ends
+  the interaction; the close request is then handled while idle.
+
+`close` followed by `interrupt` (while a handler runs) gives `interrupted` and then a 1000 close.
+
+**A client that stops reading is disconnected.** Control messages (`done`, `busy`, ...) must be
+sent within 5s (`CONTROL_SEND_TIMEOUT_SECONDS`), including any wait behind a handler send that's
+stuck because the client isn't reading. If not, the client is treated as gone and the connection
+ends.
+
 **JWT enforcement is unchanged by this protocol.** Header mode validates the token before the
 connection is accepted. Payload mode checks the JWT on **every** message, including `interrupt` and
 `close`, *before* the message is parsed. So in payload mode a message without a valid JWT closes with
@@ -148,8 +177,9 @@ informational.
 | 1000 | closed on request (`Closed by service` / `Closed by client request`), or `Idle timeout` |
 | 4008 | `Handler timeout`: the handler exceeded `WS_TASK_TIMEOUT_SECONDS` |
 | 1011 | `Handler error` (the handler raised), or an unexpected container error |
-| 1003 | the message was not valid JSON or not an AIMP message list |
-| 4001 | JWT enforcement rejected the connection |
+| 1003 | the message was not valid JSON, not an AIMP message list, or a binary frame |
+| 4002 | the client didn't offer the `vital-agent.v2` subprotocol |
+| 4001 | JWT payload mode rejected a message. In **header mode** a bad or missing token is rejected *before* the connection is accepted, so the client sees the handshake fail with **HTTP 403**, not a 4001 close. |
 | 1001 | `Server shutting down` |
 
 **Handler rules:**

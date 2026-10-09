@@ -16,7 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.datastructures import State
 from vital_agent_container.connection import AgentConnection, ConnectionClosed, _Channel
 from vital_agent_container.protocol import (
-    CloseCode, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE, URI_PROPERTY,
+    CloseCode, SUBPROTOCOL, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE, URI_PROPERTY,
     ERROR_BUSY, ERROR_CANCELLING, STATUS_DONE, STATUS_IDLE, STATUS_INTERRUPTED, STATUS_READY,
     control_error, control_status,
 )
@@ -58,6 +58,14 @@ MAX_LINGERING_HANDLERS_PER_CONNECTION = 1
 
 # Connection state that is snapshotted into each run (written by JWT enforcement)
 RUN_STATE_KEYS = ("jwt_payload", "jwt_token", "jwt_tokens")
+
+# How long a container control message (done, busy, ...) may take to send, including waiting
+# behind a stuck handler send, before the client is treated as gone
+CONTROL_SEND_TIMEOUT_SECONDS = 5.0
+
+
+class _BinaryFrame(Exception):
+    """The client sent a binary WebSocket frame; the protocol is text (JSON) only."""
 
 
 class _ConnectionRejected(Exception):
@@ -120,6 +128,8 @@ class AgentContainerApp(FastAPI):
 
         # Cancelled handler tasks that didn't unwind in time; strong refs so they aren't GC'd mid-run
         self._abandoned_tasks = set()
+        # HTTP-client closes scheduled when an abandoned handler finally finishes; strong refs
+        self._pending_client_closes = set()
 
         self.message_processor = AIMPMessageProcessor()
         self.add_routes()
@@ -242,7 +252,8 @@ class AgentContainerApp(FastAPI):
     async def _handle_jwt_disabled_websocket(self, websocket: WebSocket, client_info: str):
         """Handle WebSocket connection with JWT enforcement disabled"""
         logger.info(f"JWT enforcement disabled, accepting connection from {client_info}")
-        await websocket.accept()
+        if not await self._accept(websocket, client_info):
+            return
         logger.info(f"WebSocket connection accepted for {client_info}")
 
         async def get_jwt(data):
@@ -287,7 +298,8 @@ class AgentContainerApp(FastAPI):
             return
         
         # Accept connection after successful header validation
-        await websocket.accept()
+        if not await self._accept(websocket, client_info):
+            return
         logger.info(f"WebSocket connection accepted for {client_info}")
         websocket.state.jwt_payload = header_jwt_payload
         websocket.state.jwt_token = clean_token
@@ -303,7 +315,8 @@ class AgentContainerApp(FastAPI):
         logger.info(f"JWT payload mode enabled for {client_info}")
         
         # Accept connection immediately for payload mode
-        await websocket.accept()
+        if not await self._accept(websocket, client_info):
+            return
         logger.info(f"WebSocket connection accepted for {client_info}")
 
         async def get_jwt(data):
@@ -335,6 +348,18 @@ class AgentContainerApp(FastAPI):
 
         await self._run_connection(websocket, client_info, get_jwt)
 
+    async def _accept(self, websocket: WebSocket, client_info: str) -> bool:
+        """Accept with the protocol subprotocol. A client that didn't offer it is closed with 4002,
+        so a protocol mismatch fails at connect time with a readable code."""
+        if SUBPROTOCOL not in websocket.scope.get("subprotocols", []):
+            logger.warning(f"Client {client_info} did not offer subprotocol {SUBPROTOCOL!r}; rejecting")
+            await websocket.accept()
+            await websocket.close(code=CloseCode.UNSUPPORTED_PROTOCOL,
+                                  reason=f"Unsupported protocol; expected {SUBPROTOCOL}")
+            return False
+        await websocket.accept(subprotocol=SUBPROTOCOL)
+        return True
+
     async def _run_connection(self, websocket: WebSocket, client_info: str, get_jwt):
         """Run one accepted connection (see README "WebSocket protocol").
 
@@ -357,7 +382,7 @@ class AgentContainerApp(FastAPI):
         try:
             while True:
                 if receive_task is None:
-                    receive_task = asyncio.ensure_future(websocket.receive_text())
+                    receive_task = asyncio.ensure_future(self._receive_text(websocket))
                 waiting = {receive_task} if run is None else {receive_task, run.task}
                 if owe_ready:
                     waiting |= lingering  # wake when an interrupted handler finishes
@@ -402,7 +427,12 @@ class AgentContainerApp(FastAPI):
 
                 if receive_task in done:
                     finished_receive, receive_task = receive_task, None
-                    data = finished_receive.result()  # raises WebSocketDisconnect when the client leaves
+                    try:
+                        data = finished_receive.result()  # raises WebSocketDisconnect when the client leaves
+                    except _BinaryFrame:
+                        logger.warning(f"Binary frame from {client_info}")
+                        close_code, close_reason = CloseCode.UNSUPPORTED_DATA, "Binary frames not supported"
+                        break
                     message_count += 1
                     logger.debug(f"Received message #{message_count} from {client_info}")
 
@@ -439,6 +469,10 @@ class AgentContainerApp(FastAPI):
                             unwind.add_done_callback(unwinding.discard)
                             await self._send_control(
                                 channel, control_status(STATUS_INTERRUPTED, interrupted.connection.request_uri))
+                            if client_close_requested:
+                                # The client asked to close while this run was going; it has now ended
+                                close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
+                                break
                     elif intent == INTENT_CLOSE:
                         if run is None:
                             close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
@@ -471,19 +505,41 @@ class AgentContainerApp(FastAPI):
             logger.error(f"WebSocket communication error for {client_info}: {e!r}")
         finally:
             self._discard_receive(receive_task)
+            # Close first: every run's connection is ended before it is cancelled, so the close
+            # frame needn't wait behind handler cleanup
+            if run is not None:
+                run.connection._end()
             try:
+                if channel.is_open:
+                    logger.info(f"Closing connection for {client_info}: {int(close_code)} {close_reason}")
+                await channel.close(close_code, close_reason)
+            finally:
                 if run is not None:
                     await self._cancel_run(run, client_info)
                 if unwinding:
                     await asyncio.wait(set(unwinding))  # each is bounded by the unwind grace
-            finally:
-                if channel.is_open:
-                    logger.info(f"Closing connection for {client_info}: {int(close_code)} {close_reason}")
-                await channel.close(close_code, close_reason)
 
     @staticmethod
     async def _send_control(channel: _Channel, message: dict):
-        await channel.send_text(json.dumps(message))
+        """Bounded, so a handler send stuck on a client that stopped reading can't stall the loop
+        (and with it the idle timer and the deadline)."""
+        try:
+            await asyncio.wait_for(channel.send_text(json.dumps(message)), CONTROL_SEND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(f"Control message not sent within {CONTROL_SEND_TIMEOUT_SECONDS}s; "
+                           f"treating the client as gone")
+            raise ConnectionClosed("client is not reading") from None
+
+    @staticmethod
+    async def _receive_text(websocket: WebSocket) -> str:
+        """Like WebSocket.receive_text, but a binary frame raises _BinaryFrame instead of KeyError."""
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(message.get("code", 1000), message.get("reason"))
+        text = message.get("text")
+        if text is None:
+            raise _BinaryFrame()
+        return text
 
     def _start_run(self, channel: _Channel, websocket: WebSocket, client_info: str, data: str,
                    request_uri, jwt_payload, jwt_token) -> _HandlerRun:
@@ -527,6 +583,8 @@ class AgentContainerApp(FastAPI):
                 await self._close_client(run.client, client_info)
             else:
                 self._abandoned_tasks.add(run.task)
+                run.task.add_done_callback(
+                    lambda task, client=run.client: self._close_client_later(client, client_info))
                 logger.error(f"Cancelled handler for {client_info} did not finish within "
                              f"{HANDLER_UNWIND_GRACE_SECONDS}s; abandoning it "
                              f"({len(self._abandoned_tasks)} abandoned handlers in this process)")
@@ -538,6 +596,12 @@ class AgentContainerApp(FastAPI):
             await client.aclose()
         except Exception as e:
             logger.warning(f"Error closing HTTP client for {client_info}: {e!r}")
+
+    def _close_client_later(self, client: TaskManagerAsyncClient, client_info: str):
+        """Done callback for an abandoned handler: close its HTTP client once it finishes."""
+        closing = asyncio.get_running_loop().create_task(self._close_client(client, client_info))
+        self._pending_client_closes.add(closing)
+        closing.add_done_callback(self._pending_client_closes.discard)
 
     def _forget_abandoned_task(self, task: asyncio.Task):
         self._abandoned_tasks.discard(task)
