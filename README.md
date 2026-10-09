@@ -160,7 +160,11 @@ informational.
   (`HANDLER_UNWIND_GRACE_SECONDS`) to unwind. After that it's logged at ERROR and abandoned. It keeps
   running in the background until it finishes. Don't catch `CancelledError` to keep working.
   After an interrupt the unwind happens in the background. `interrupted` is sent at once, and the
-  next message can start a new run while the old one is still unwinding.
+  next message can start a new run while the old one is still unwinding. A connection may have at
+  most **one** interrupted handler still running alongside a new one. Beyond that, new requests get
+  `busy` (`"previous requests are still being cancelled"`) until an interrupted handler finishes,
+  including abandoned ones. A handler that ignores cancellation therefore holds up its own
+  connection, not the process.
 - On the deadline the container closes with 4008 *before* cancelling the handler, even if a handler
   send is stuck (it waits at most 1s for it). A handler can't
   replace that with its own reply, so enforce a shorter deadline in the handler if you want to answer

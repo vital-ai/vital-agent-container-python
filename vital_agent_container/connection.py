@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from starlette.datastructures import State
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
@@ -30,8 +30,12 @@ class _Channel:
                 and self.websocket.application_state == WebSocketState.CONNECTED
                 and self.websocket.client_state == WebSocketState.CONNECTED)
 
-    async def send_text(self, text: str):
+    async def send_text(self, text: str, sender_ended: Optional[Callable[[], bool]] = None):
         async with self._send_lock:
+            # Re-checked under the lock: a send that was waiting for it when its run ended
+            # (interrupt, deadline) must not go out into the next interaction
+            if sender_ended is not None and sender_ended():
+                raise ConnectionClosed("this handler run has ended")
             if not self.is_open:
                 raise ConnectionClosed("connection has ended")
             try:
@@ -95,7 +99,7 @@ class AgentConnection:
     async def send_text(self, text: str):
         if self._ended:
             raise ConnectionClosed("this handler run has ended")
-        await self._channel.send_text(text)
+        await self._channel.send_text(text, sender_ended=lambda: self._ended)
 
     async def send_json(self, obj: Any):
         await self.send_text(json.dumps(obj))

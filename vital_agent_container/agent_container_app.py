@@ -51,6 +51,13 @@ service_identifier = AWSUtils.get_task_arn()
 # before it is abandoned
 HANDLER_UNWIND_GRACE_SECONDS = 5.0
 
+# Interrupted handlers that may still be running (unwinding or abandoned) while a connection
+# starts a new one. 1 means at most two live handlers per connection.
+MAX_LINGERING_HANDLERS_PER_CONNECTION = 1
+
+# Connection state that is snapshotted into each run (written by JWT enforcement)
+RUN_STATE_KEYS = ("jwt_payload", "jwt_token", "jwt_tokens")
+
 
 class _ConnectionRejected(Exception):
     """Raised by a connection's JWT step to end the connection with a specific close code."""
@@ -338,7 +345,8 @@ class AgentContainerApp(FastAPI):
         channel = _Channel(websocket)
         receive_task = None
         run: Optional[_HandlerRun] = None
-        unwinding = set()  # interrupted runs unwinding in the background
+        unwinding = set()  # unwind tasks for interrupted runs (each bounded by the grace period)
+        lingering = set()  # interrupted handler tasks not yet finished, abandoned ones included
         client_close_requested = False
         message_count = 0
         # Close used when the loop ends; overwritten by each normal way of ending
@@ -416,6 +424,8 @@ class AgentContainerApp(FastAPI):
                             # The interrupted run can no longer send, so it may unwind in the
                             # background while the loop keeps reading
                             interrupted.connection._end()
+                            lingering.add(interrupted.task)
+                            interrupted.task.add_done_callback(lingering.discard)
                             unwind = asyncio.create_task(self._cancel_run(interrupted, client_info))
                             unwinding.add(unwind)
                             unwind.add_done_callback(unwinding.discard)
@@ -431,6 +441,12 @@ class AgentContainerApp(FastAPI):
                         logger.info(f"Busy: rejecting message #{message_count} from {client_info}")
                         await self._send_control(
                             channel, control_error(ERROR_BUSY, "a message is already being processed", uri))
+                    elif len(lingering) > MAX_LINGERING_HANDLERS_PER_CONNECTION:
+                        # Interrupt-then-resend may overlap one cancelled handler, not any number
+                        logger.info(f"Busy: rejecting message #{message_count} from {client_info}; "
+                                    f"{len(lingering)} interrupted handlers still running")
+                        await self._send_control(
+                            channel, control_error(ERROR_BUSY, "previous requests are still being cancelled", uri))
                     else:
                         logger.info(f"Processing message #{message_count} for {client_info}")
                         run = self._start_run(channel, websocket, client_info, data, uri, jwt_payload, jwt_token)
@@ -464,7 +480,8 @@ class AgentContainerApp(FastAPI):
                    request_uri, jwt_payload, jwt_token) -> _HandlerRun:
         # Snapshot connection state for this run, so later messages (busy, interrupt, close)
         # can't change what a running handler sees
-        state = State(dict(getattr(websocket.state, "_state", {})))
+        state = State({key: getattr(websocket.state, key) for key in RUN_STATE_KEYS
+                       if hasattr(websocket.state, key)})
         connection = AgentConnection(channel, client_info, state=state, request_uri=request_uri)
         client = TaskManagerAsyncClient()
         task = asyncio.create_task(self.message_processor.process_message(
@@ -500,9 +517,10 @@ class AgentContainerApp(FastAPI):
                 self._retrieve_exception(run.task)
                 await self._close_client(run.client, client_info)
             else:
-                logger.error(f"Cancelled handler for {client_info} did not finish within "
-                             f"{HANDLER_UNWIND_GRACE_SECONDS}s; abandoning it")
                 self._abandoned_tasks.add(run.task)
+                logger.error(f"Cancelled handler for {client_info} did not finish within "
+                             f"{HANDLER_UNWIND_GRACE_SECONDS}s; abandoning it "
+                             f"({len(self._abandoned_tasks)} abandoned handlers in this process)")
                 run.task.add_done_callback(self._forget_abandoned_task)
 
     @staticmethod

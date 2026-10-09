@@ -133,6 +133,13 @@ async def slow_unwind_then_late_send(connection, data):
 
 
 seen_subjects = []
+seen_states = []
+
+
+async def record_state(connection, data):
+    seen_states.append({key: getattr(connection.state, key, None)
+                        for key in ("jwt_payload", "jwt_token", "jwt_tokens")})
+    await connection.send_text("reply")
 
 
 async def record_jwt_subject_over_time(connection, data):
@@ -378,6 +385,63 @@ def test_interrupt_unwinds_in_background_and_blocks_late_sends(logs):
         wait_done(app)
 
 
+def test_interrupted_handlers_are_capped_per_connection(logs):
+    """Interrupt-then-resend may overlap one cancelled handler, not any number."""
+    late_send_results.clear()
+    app, handler = make_app(slow_unwind_then_late_send)  # interrupted handlers linger 0.5s
+    with connect(app) as ws:
+        ws.send_text(_message(text="hang", uri="urn:test:a"))
+        ws.send_text(_message(intent="interrupt"))
+        assert receive_control(ws)["in_reply_to"] == "urn:test:a"
+
+        # One lingering handler: a new request is still accepted at once
+        ws.send_text(_message(text="hang", uri="urn:test:b"))
+        ws.send_text(_message(intent="interrupt"))
+        assert receive_control(ws)["in_reply_to"] == "urn:test:b"
+
+        # Two lingering handlers: further requests are refused until they finish
+        ws.send_text(_message(uri="urn:test:c"))
+        assert receive_control(ws) == {"type": "sdk.error", "error": "busy",
+                                       "detail": "previous requests are still being cancelled",
+                                       "in_reply_to": "urn:test:c"}
+
+        for _ in range(300):
+            if len(late_send_results) == 2:
+                break
+            threading.Event().wait(0.01)
+        assert late_send_results == ["ConnectionClosed", "ConnectionClosed"]
+        threading.Event().wait(0.05)  # let the loop see the handlers finish
+
+        ws.send_text(_message(uri="urn:test:d"))
+        assert ws.receive_text() == "reply"
+        expect_done(ws, "urn:test:d")
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    assert handler.calls == 3  # a, b, d; c was refused
+
+
+@pytest.mark.parametrize("mode", ["header", "payload"])
+def test_run_state_snapshot_has_the_jwt(logs, mode):
+    """Guards the snapshot: if it came back empty, handlers would silently lose their JWT state."""
+    seen_states.clear()
+    app, _ = make_app(record_state, mode)
+    with connect(app, mode) as ws:
+        ws.send_text(_message(mode))
+        assert ws.receive_text() == "reply"
+        expect_done(ws)
+        ws.send_text(_message(mode, intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    state = seen_states[0]
+    if mode == "header":
+        assert state["jwt_payload"]["sub"] == "test-user" and state["jwt_token"]
+    else:
+        assert state["jwt_payload"]["jwt_token"]["sub"] == "test-user" and state["jwt_tokens"]["jwt_token"]
+
+
 def test_payload_mode_run_state_is_not_changed_by_later_messages(logs):
     seen_subjects.clear()
     app, _ = make_app(record_jwt_subject_over_time, "payload")
@@ -616,6 +680,24 @@ async def test_deadline_close_is_not_blocked_by_a_stuck_send(monkeypatch):
     assert send_started.is_set()
     assert websocket.closed_with == (CloseCode.HANDLER_TIMEOUT, "Handler timeout")
     assert handler.finally_ran.is_set()
+
+
+async def test_send_waiting_for_the_lock_does_not_go_out_after_its_run_ends():
+    """A handler send queued behind another send must not slip out after an interrupt."""
+    from vital_agent_container.connection import AgentConnection, _Channel
+    websocket = FakeWebSocket([])
+    channel = _Channel(websocket)
+    connection = AgentConnection(channel, "test")
+
+    await channel._send_lock.acquire()  # another send is in progress
+    pending = asyncio.create_task(connection.send_text("late"))
+    await asyncio.sleep(0.01)           # the send is now waiting for the lock
+    connection._end()                   # its run is interrupted meanwhile
+    channel._send_lock.release()
+
+    with pytest.raises(ConnectionClosed):
+        await pending
+    assert websocket.sent == []
 
 
 async def test_shutdown_cancels_handler_and_closes_1001():
