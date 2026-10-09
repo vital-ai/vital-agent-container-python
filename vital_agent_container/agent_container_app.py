@@ -92,20 +92,27 @@ class AgentContainerApp(FastAPI):
     
     @staticmethod
     def _resolve_timeout(value, env_var: str, default: float):
-        """Explicit value, else env var, else default. 0 or empty disables (returns None)."""
+        """Explicit value, else env var, else default. Only an explicit 0 disables (returns None).
+
+        An empty env var means "use the default", so a deploy template that renders a
+        missing value as empty can't silently turn a timeout off.
+        """
         if value is None:
-            raw = os.getenv(env_var)
-            if raw is None:
+            raw = (os.getenv(env_var) or "").strip()
+            if not raw:
                 value = default
-            elif not raw.strip():
-                value = 0
             else:
                 try:
                     value = float(raw)
                 except ValueError:
                     raise ValueError(f"{env_var} must be a number of seconds, got {raw!r}") from None
         value = float(value)
-        return value if value > 0 else None
+        if value < 0:
+            raise ValueError(f"{env_var} must be 0 (disabled) or a positive number of seconds, got {value}")
+        if value == 0:
+            logger.warning(f"{env_var} is 0: this WebSocket timeout is disabled")
+            return None
+        return value
 
     @staticmethod
     def _ws_open(websocket: WebSocket) -> bool:
@@ -186,35 +193,42 @@ class AgentContainerApp(FastAPI):
 
         # Backstop deadline for the whole handler run. Handlers should keep their own,
         # tighter deadlines so they can send a proper error response.
-        deadline = asyncio.timeout(self.ws_task_timeout)
+        # The handler runs in its own task so that on the deadline we can close with 1011
+        # *before* cancelling it; a handler that closes the socket in its own cleanup
+        # would otherwise replace our code with a plain 1000.
+        handler_task = asyncio.create_task(self.message_processor.process_message(
+            handler=self.handler,
+            app_config=self.config,
+            client=client,
+            websocket=websocket,
+            data=data,
+            started_event=started_event,
+            jwt_payload=jwt_payload,
+            jwt_token=jwt_token
+        ))
         try:
-            try:
-                async with deadline:
-                    await self.message_processor.process_message(
-                        handler=self.handler,
-                        app_config=self.config,
-                        client=client,
-                        websocket=websocket,
-                        data=data,
-                        started_event=started_event,
-                        jwt_payload=jwt_payload,
-                        jwt_token=jwt_token
-                    )
-            except TimeoutError:
-                # A TimeoutError from the handler's own deadline is not ours to swallow
-                if not deadline.expired():
-                    raise
-            # Checked outside the except: a handler that swallows the CancelledError
-            # exits the block normally, but the deadline still fired
-            if deadline.expired():
-                logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelled")
-                await client.cancel_current_tasks()
-                if self._ws_open(websocket):
-                    try:
-                        await websocket.close(code=1011, reason="Handler timeout")
-                    except Exception as e:
-                        logger.warning(f"Error closing WebSocket after handler timeout for {client_info}: {e}")
+            done, _ = await asyncio.wait({handler_task}, timeout=self.ws_task_timeout)
+            if done:
+                # Re-raises the handler's exception, including a TimeoutError from its own deadline
+                return handler_task.result()
+
+            logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelled")
+            if self._ws_open(websocket):
+                try:
+                    await websocket.close(code=1011, reason="Handler timeout")
+                except Exception as e:
+                    logger.warning(f"Error closing WebSocket after handler timeout for {client_info}: {e}")
+            handler_task.cancel()
+            await client.cancel_current_tasks()
+            # Let the handler unwind; what it raises while cancelled is not a new failure
+            await asyncio.wait({handler_task})
+            if not handler_task.cancelled():
+                handler_task.exception()  # retrieve it, so asyncio doesn't warn
         finally:
+            # Covers our own cancellation (interrupt, cleanup, shutdown) while waiting
+            if not handler_task.done():
+                handler_task.cancel()
+                await asyncio.wait({handler_task})
             # Never leave the receive loop waiting on a handler that didn't signal
             started_event.set()
 

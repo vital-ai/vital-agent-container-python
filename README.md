@@ -114,13 +114,41 @@ Two timeouts bound how long a connection stays open:
 | Env var | Constructor kwarg | Default | Effect |
 |---|---|---|---|
 | `WS_IDLE_TIMEOUT_SECONDS` | `ws_idle_timeout` | `300` | Closes the connection (code 1000, `Idle timeout`) after this long with no messages and no handler running. A running handler is never cancelled by this timeout. |
-| `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Cancels a handler that runs longer than this and closes the connection (code 1011, `Handler timeout`). Logged at ERROR. |
+| `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Closes the connection (code 1011, `Handler timeout`) and then cancels a handler that runs longer than this. Logged at ERROR. |
 
-Set either one to `0` (or empty) to disable it. A constructor kwarg overrides the env var. Values
-are plain seconds (`90`, `2.5`). Anything else (e.g. `5m`) raises `ValueError` when the app is
-constructed.
+- **Values:** plain seconds (`90`, `2.5`). Anything else (e.g. `5m`), or a negative number, raises
+  `ValueError` when the app is constructed.
+- **Disabling:** only an explicit `0` turns a timeout off, and it logs a WARNING at startup. An empty
+  or unset variable uses the default, so a deploy template that renders a missing value as empty
+  can't turn the timeouts off by accident.
+- **Precedence:** a constructor kwarg overrides the env var.
+
+On the task deadline, the 1011 close is sent *before* the handler is cancelled. If the handler then
+closes the socket in its own cleanup, that close is a no-op: the client still sees 1011, not 1000.
+
 `WS_TASK_TIMEOUT_SECONDS` is a backstop. Handlers should still enforce their own, shorter deadlines
 so they can send a proper error response.
+
+**The task deadline only bounds async work.** It fires by cancelling the handler, and a
+cancellation can only land while the handler is awaiting something. A handler stuck in blocking
+synchronous code (a sync HTTP or database client, CPU-bound work, `time.sleep`) is not interrupted.
+That code also blocks the event loop, so every connection's timers in the process stall until it
+returns. Run blocking calls with `asyncio.to_thread(...)` (or in an executor). Then the event
+loop keeps running and the deadline can fire, though the thread itself runs to completion in the
+background. Callers should keep their own timeouts rather than relying on the server's deadline.
+
+Python can't forcibly stop a thread, so bounding blocking work is the handler's job:
+
+1. **Put a timeout on every blocking call.** This is the main fix: e.g. `requests.get(..., timeout=30)`,
+   database connect and statement timeouts, client-library timeouts. The call then ends on its own.
+   A call with no timeout that hangs holds a thread-pool slot forever. The default pool has
+   `min(32, cpu_count + 4)` threads, so enough of these starve every later `to_thread` call in the
+   process.
+2. **Use cooperative cancellation for long loops or CPU-bound work.** Pass a `threading.Event` into
+   the sync code, check it between steps, and set it when the handler is cancelled
+   (`except asyncio.CancelledError: stop.set(); raise`).
+3. **Use a process instead of a thread** (`ProcessPoolExecutor` or a subprocess you manage) for work
+   that must be killable.
 
 ## Usage
 

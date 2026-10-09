@@ -495,12 +495,15 @@ def test_hung_handler_is_cancelled_and_closed_1011(logs, mode):
     assert not any(NOT_CONNECTED in m or "communication error" in m for m in errs)
 
 
-def test_hung_handler_closing_in_finally_is_not_closed_twice(logs):
-    app, _ = make_app(hang_then_close_in_finally, ws_task_timeout=0.2)
+def test_deadline_1011_wins_over_handler_close_in_finally(logs):
+    """cardiff-style handler closes (1000) in its cleanup; the SDK closes with 1011 first."""
+    app, handler = make_app(hang_then_close_in_finally, ws_task_timeout=0.2)
     with TestClient(app).websocket_connect("/ws") as ws:
         ws.send_text(_message("disabled"))
-        assert receive_close(ws)[0] == 1000  # the handler's own close wins
+        assert receive_close(ws) == (1011, "Handler timeout")
         wait_done(app)
+
+    assert handler.finally_ran.is_set()
 
     assert not any(NOT_CONNECTED in m or "communication error" in m or "Error closing" in m
                    for m in errors(logs) + infos(logs))
@@ -548,10 +551,33 @@ def test_timeout_defaults(monkeypatch):
 
 def test_timeouts_from_env(monkeypatch):
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "45")
-    monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "")
+    monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "0")
     app, _ = make_app(reply_only)
     assert app.ws_idle_timeout == 45
     assert app.ws_task_timeout is None
+
+
+def test_empty_env_uses_default(monkeypatch):
+    """A template rendering a missing value as empty must not turn the timeouts off."""
+    monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "")
+    monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "  ")
+    app, _ = make_app(reply_only)
+    assert app.ws_idle_timeout == 300
+    assert app.ws_task_timeout == 600
+
+
+def test_disabled_timeout_logs_warning(logs, monkeypatch):
+    monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "0")
+    make_app(reply_only)
+    warnings = [r.getMessage() for r in logs.records
+                if r.name == LOGGER_NAME and r.levelno == logging.WARNING]
+    assert any("WS_TASK_TIMEOUT_SECONDS is 0" in m for m in warnings)
+
+
+def test_negative_timeout_is_rejected(monkeypatch):
+    monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "-5")
+    with pytest.raises(ValueError, match="WS_IDLE_TIMEOUT_SECONDS must be 0"):
+        make_app(reply_only)
 
 
 def test_kwargs_override_env_and_zero_disables(monkeypatch):
