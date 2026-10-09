@@ -1,12 +1,11 @@
-import asyncio
 from typing import Optional, Dict, Any
 import httpx
-from starlette.websockets import WebSocket
+from vital_agent_container.connection import AgentConnection
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
 
 
 class AIMPEchoMessageHandler(AIMPMessageHandlerInf):
-    async def process_message(self, *, app_config: Dict[str, Any], client: httpx.AsyncClient, websocket: WebSocket, data: str, started_event: asyncio.Event, jwt_payload: Optional[Dict[str, Any]] = None, jwt_token: Optional[str] = None):
+    async def process_message(self, *, app_config: Dict[str, Any], client: httpx.AsyncClient, connection: AgentConnection, data: str, jwt_payload: Optional[Dict[str, Any]] = None, jwt_token: Optional[str] = None):
         try:
             print(f"Received Message: {data}")
             
@@ -33,19 +32,7 @@ class AIMPEchoMessageHandler(AIMPMessageHandlerInf):
             else:
                 print("No JWT payload provided")
             
-            await websocket.send_text(data)
+            await connection.send_text(data)
             print(f"Sent Message: {data}")
-            # await websocket.close(1000, "Processing Complete")
-            # print(f"Websocket closed.")
-        except asyncio.CancelledError:
-            # log canceling
-            raise
         finally:
-            # Always signal completion so the container's receive loop resumes
-            # even if processing raised; otherwise the connection would leak.
-            started_event.set()
             print(f"Completed Event.")
-
-
-
-

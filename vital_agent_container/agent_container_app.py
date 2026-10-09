@@ -10,8 +10,14 @@ from logging.handlers import RotatingFileHandler
 from pythonjsonlogger import jsonlogger
 import httpx
 from dotenv import load_dotenv
+from dataclasses import dataclass
+from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
+from vital_agent_container.connection import AgentConnection, ConnectionClosed
+from vital_agent_container.protocol import (
+    CloseCode, INTENT_PROPERTY, INTENT_INTERRUPT, INTENT_CLOSE,
+    ERROR_BUSY, STATUS_IDLE, STATUS_INTERRUPTED, control_error, control_status,
+)
 from vital_agent_container.tasks.task_manager_async_client import TaskManagerAsyncClient
 from vital_agent_container.utils.aws_utils import AWSUtils
 from vital_agent_container.utils.config_utils import ConfigUtils
@@ -39,17 +45,32 @@ logger.addHandler(file_handler)
 
 service_identifier = AWSUtils.get_task_arn()
 
-# How long a handler task that closed the socket gets to finish before cleanup cancels it
-SERVER_CLOSE_GRACE_SECONDS = 5.0
+
+# How long a cancelled handler (deadline, interrupt, disconnect, shutdown) gets to unwind
+# before it is abandoned
+HANDLER_UNWIND_GRACE_SECONDS = 5.0
 
 
 class _ConnectionRejected(Exception):
-    """Raised by a receive loop's JWT step to end the connection with a specific close code."""
+    """Raised by a connection's JWT step to end the connection with a specific close code."""
 
     def __init__(self, code: int, reason: str):
         super().__init__(reason)
         self.code = code
         self.reason = reason
+
+
+@dataclass
+class _HandlerRun:
+    """One running handler invocation."""
+    task: asyncio.Task
+    client: TaskManagerAsyncClient
+    started_at: float
+
+    def remaining(self, timeout: Optional[float]) -> Optional[float]:
+        if timeout is None:
+            return None
+        return max(0.0, self.started_at + timeout - asyncio.get_running_loop().time())
 
 
 class AgentContainerApp(FastAPI):
@@ -87,6 +108,9 @@ class AgentContainerApp(FastAPI):
         self.ws_task_timeout = self._resolve_timeout(ws_task_timeout, 'WS_TASK_TIMEOUT_SECONDS', 600)
         logger.info(f"WebSocket timeouts: idle={self.ws_idle_timeout}s, task={self.ws_task_timeout}s")
 
+        # Cancelled handler tasks that didn't unwind in time; strong refs so they aren't GC'd mid-run
+        self._abandoned_tasks = set()
+
         self.message_processor = AIMPMessageProcessor()
         self.add_routes()
     
@@ -114,11 +138,6 @@ class AgentContainerApp(FastAPI):
             return None
         return value
 
-    @staticmethod
-    def _ws_open(websocket: WebSocket) -> bool:
-        """True only if neither side has closed, i.e. it is safe to send or close."""
-        return (websocket.application_state == WebSocketState.CONNECTED
-                and websocket.client_state == WebSocketState.CONNECTED)
 
     def _load_jwt_config_from_env(self):
         """Load JWT configuration from environment variables"""
@@ -173,64 +192,6 @@ class AgentContainerApp(FastAPI):
             logger.error(f"Error extracting JWT from message payload: {e}")
             return (None, None)
 
-    async def process_ws_message(self, *, websocket: WebSocket, data: str, started_event: asyncio.Event = None, jwt_payload=None, jwt_token=None, client_info: str = "unknown"):
-
-        logger.info(f"process_ws_message: Processing: {data}")
-
-        # Use provided JWT payload or get from websocket state
-        if jwt_payload is None:
-            jwt_payload = getattr(websocket.state, 'jwt_payload', None)
-
-        # Use provided JWT token or get from websocket state
-        if jwt_token is None:
-            jwt_token = getattr(websocket.state, 'jwt_token', None)
-
-        # Create client; use the caller-provided started_event so the awaiting
-        # coroutine in _process_message_with_intent_handling is the one the handler sets.
-        client = TaskManagerAsyncClient()
-        if started_event is None:
-            started_event = asyncio.Event()
-
-        # Backstop deadline for the whole handler run. Handlers should keep their own,
-        # tighter deadlines so they can send a proper error response.
-        # The handler runs in its own task so that on the deadline we can close with 1011
-        # *before* cancelling it; a handler that closes the socket in its own cleanup
-        # would otherwise replace our code with a plain 1000.
-        handler_task = asyncio.create_task(self.message_processor.process_message(
-            handler=self.handler,
-            app_config=self.config,
-            client=client,
-            websocket=websocket,
-            data=data,
-            started_event=started_event,
-            jwt_payload=jwt_payload,
-            jwt_token=jwt_token
-        ))
-        try:
-            done, _ = await asyncio.wait({handler_task}, timeout=self.ws_task_timeout)
-            if done:
-                # Re-raises the handler's exception, including a TimeoutError from its own deadline
-                return handler_task.result()
-
-            logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelled")
-            if self._ws_open(websocket):
-                try:
-                    await websocket.close(code=1011, reason="Handler timeout")
-                except Exception as e:
-                    logger.warning(f"Error closing WebSocket after handler timeout for {client_info}: {e}")
-            handler_task.cancel()
-            await client.cancel_current_tasks()
-            # Let the handler unwind; what it raises while cancelled is not a new failure
-            await asyncio.wait({handler_task})
-            if not handler_task.cancelled():
-                handler_task.exception()  # retrieve it, so asyncio doesn't warn
-        finally:
-            # Covers our own cancellation (interrupt, cleanup, shutdown) while waiting
-            if not handler_task.done():
-                handler_task.cancel()
-                await asyncio.wait({handler_task})
-            # Never leave the receive loop waiting on a handler that didn't signal
-            started_event.set()
 
     def add_routes(self):
         @self.on_event("shutdown")
@@ -259,12 +220,12 @@ class AgentContainerApp(FastAPI):
                     await self._handle_jwt_payload_mode_websocket(websocket, client_info)
                 else:
                     logger.error(f"Invalid JWT enforcement mode '{enforcement_mode}' for {client_info}")
-                    await websocket.close(code=1011, reason="Invalid configuration")
+                    await websocket.close(code=CloseCode.INTERNAL_ERROR, reason="Invalid configuration")
                     
             except Exception as e:
                 logger.error(f"WebSocket endpoint error for {client_info}: {str(e)}")
                 try:
-                    await websocket.close(code=1011, reason="Internal server error")
+                    await websocket.close(code=CloseCode.INTERNAL_ERROR, reason="Internal server error")
                 except:
                     pass  # Connection might already be closed
 
@@ -278,7 +239,7 @@ class AgentContainerApp(FastAPI):
             # Process message without JWT validation
             return None, None
 
-        await self._run_receive_loop(websocket, client_info, get_jwt)
+        await self._run_connection(websocket, client_info, get_jwt)
 
     async def _handle_jwt_header_mode_websocket(self, websocket: WebSocket, client_info: str):
         """Handle WebSocket connection with JWT header mode enforcement"""
@@ -290,7 +251,7 @@ class AgentContainerApp(FastAPI):
         
         if not (auth_header or jwt_token_header):
             logger.warning(f"JWT required but not provided in headers for {client_info}")
-            await websocket.close(code=4001, reason="JWT token required")
+            await websocket.close(code=CloseCode.UNAUTHORIZED, reason="JWT token required")
             return
         
         token = auth_header or jwt_token_header
@@ -304,7 +265,7 @@ class AgentContainerApp(FastAPI):
             header_jwt_payload = await self.validate_jwt_token(token)
             if not header_jwt_payload:
                 logger.warning(f"Header JWT validation failed for {client_info}")
-                await websocket.close(code=4001, reason="Invalid JWT token")
+                await websocket.close(code=CloseCode.UNAUTHORIZED, reason="Invalid JWT token")
                 return
             
             user_id = header_jwt_payload.get('sub', 'unknown')
@@ -312,7 +273,7 @@ class AgentContainerApp(FastAPI):
             
         except Exception as e:
             logger.error(f"Header JWT validation error for {client_info}: {str(e)}")
-            await websocket.close(code=4001, reason="JWT validation failed")
+            await websocket.close(code=CloseCode.UNAUTHORIZED, reason="JWT validation failed")
             return
         
         # Accept connection after successful header validation
@@ -325,7 +286,7 @@ class AgentContainerApp(FastAPI):
             # Process message with header JWT payload
             return header_jwt_payload, clean_token
 
-        await self._run_receive_loop(websocket, client_info, get_jwt)
+        await self._run_connection(websocket, client_info, get_jwt)
 
     async def _handle_jwt_payload_mode_websocket(self, websocket: WebSocket, client_info: str):
         """Handle WebSocket connection with JWT payload mode enforcement"""
@@ -341,11 +302,11 @@ class AgentContainerApp(FastAPI):
                 message_jwt_payload, message_jwt_tokens = await self.extract_jwt_from_message_payload(data)
             except Exception as e:
                 logger.error(f"Payload JWT extraction error for {client_info}: {str(e)}")
-                raise _ConnectionRejected(4001, "JWT validation failed")
+                raise _ConnectionRejected(CloseCode.UNAUTHORIZED, "JWT validation failed")
 
             if not message_jwt_payload:
                 logger.warning(f"No JWT found in message payload for {client_info}")
-                raise _ConnectionRejected(4001, "JWT token required in message payload")
+                raise _ConnectionRejected(CloseCode.UNAUTHORIZED, "JWT token required in message payload")
 
             # Log authentication info based on JWT format
             if isinstance(message_jwt_payload, dict) and ('jwt_token' in message_jwt_payload or 'jwt_auth_token' in message_jwt_payload):
@@ -362,181 +323,182 @@ class AgentContainerApp(FastAPI):
             websocket.state.jwt_tokens = message_jwt_tokens
             return message_jwt_payload, message_jwt_tokens
 
-        await self._run_receive_loop(websocket, client_info, get_jwt)
+        await self._run_connection(websocket, client_info, get_jwt)
 
-    async def _run_receive_loop(self, websocket: WebSocket, client_info: str, get_jwt):
-        """Receive loop shared by all JWT modes; owns the connection's lifecycle.
+    async def _run_connection(self, websocket: WebSocket, client_info: str, get_jwt):
+        """Run one accepted connection (see README "WebSocket protocol").
 
-        get_jwt(data) returns (jwt_payload, jwt_token) for a message, or raises
-        _ConnectionRejected to end the connection with that close code.
+        The loop always reads, so interrupts, close requests and busy rejections work while a
+        handler runs, and it is the only place the socket is closed. get_jwt(data) returns
+        (jwt_payload, jwt_token) for a message, or raises _ConnectionRejected.
         """
-        client = TaskManagerAsyncClient()
-        background_tasks = []
+        connection = AgentConnection(websocket, client_info)
+        receive_task = None
+        run: Optional[_HandlerRun] = None
+        client_close_requested = False
         message_count = 0
-        # Close used by cleanup if the socket is still open when the loop ends
-        close_code, close_reason = 1011, "Internal server error"
-        closed_by_server = False
+        # Close used when the loop ends; overwritten by each normal way of ending
+        close_code, close_reason = CloseCode.INTERNAL_ERROR, "Internal server error"
 
         try:
-            # Exits once either side closes; a handler closing the socket is a normal end
-            while websocket.application_state == WebSocketState.CONNECTED:
-                try:
-                    data = await asyncio.wait_for(websocket.receive_text(), timeout=self.ws_idle_timeout)
-                except TimeoutError:
-                    background_tasks[:] = self._prune_tasks(background_tasks, client_info)
-                    if background_tasks:
-                        continue  # work in flight: not idle (bounded by the task deadline)
-                    logger.info(f"Idle timeout for {client_info} after {message_count} messages")
-                    close_code, close_reason = 1000, "Idle timeout"
+            while True:
+                if receive_task is None:
+                    receive_task = asyncio.ensure_future(websocket.receive_text())
+                waiting = {receive_task} if run is None else {receive_task, run.task}
+                # Idle timer only while no handler runs; otherwise the handler's deadline
+                timeout = self.ws_idle_timeout if run is None else run.remaining(self.ws_task_timeout)
+                done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+
+                if not done:
+                    if run is None:
+                        logger.info(f"Idle timeout for {client_info} after {message_count} messages")
+                        close_code, close_reason = CloseCode.NORMAL, "Idle timeout"
+                    else:
+                        logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelling")
+                        close_code, close_reason = CloseCode.HANDLER_TIMEOUT, "Handler timeout"
+                        # Close before cancelling, so the client sees 4008 whatever the handler's cleanup does
+                        await connection._close(close_code, close_reason)
                     break
 
-                background_tasks[:] = self._prune_tasks(background_tasks, client_info)
-                message_count += 1
-                logger.debug(f"Received message #{message_count} from {client_info}")
+                if run is not None and run.task in done:
+                    finished, run = run, None
+                    error = await self._finish_run(finished, client_info)
+                    if error is not None:
+                        if isinstance(error, ConnectionClosed) or not connection.is_open:
+                            logger.info(f"Handler for {client_info} stopped: connection has ended")
+                        else:
+                            logger.error(f"Handler failed for {client_info}: {error!r}")
+                            close_code, close_reason = CloseCode.INTERNAL_ERROR, "Handler error"
+                        break
+                    if connection.close_requested:
+                        close_code, close_reason = CloseCode.NORMAL, "Closed by service"
+                        break
+                    if client_close_requested:
+                        close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
+                        break
 
-                try:
+                if receive_task in done:
+                    finished_receive, receive_task = receive_task, None
+                    data = finished_receive.result()  # raises WebSocketDisconnect when the client leaves
+                    message_count += 1
+                    logger.debug(f"Received message #{message_count} from {client_info}")
+
+                    # JWT first, as before contract v2: in payload mode every message, whatever it
+                    # contains, must carry a valid JWT
                     jwt_payload, jwt_token = await get_jwt(data)
-                except _ConnectionRejected as rejected:
-                    close_code, close_reason = rejected.code, rejected.reason
-                    break
 
-                await self._process_message_with_intent_handling(websocket, data, client, background_tasks, client_info, message_count, jwt_payload, jwt_token)
-            else:
-                closed_by_server = True
-                logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
+                    try:
+                        intent = json.loads(data)[0].get(INTENT_PROPERTY)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON from {client_info}")
+                        close_code, close_reason = CloseCode.UNSUPPORTED_DATA, "Invalid JSON"
+                        break
+                    except (TypeError, KeyError, IndexError, AttributeError):
+                        logger.warning(f"Message from {client_info} is not an AIMP message list")
+                        close_code, close_reason = CloseCode.UNSUPPORTED_DATA, "Invalid message"
+                        break
 
-        except WebSocketDisconnect:
-            if websocket.application_state == WebSocketState.DISCONNECTED:
-                # Our side closed first; this is the client answering our close
-                closed_by_server = True
-                logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
-            else:
-                logger.info(f"WebSocket disconnected normally for {client_info} after {message_count} messages")
-        except RuntimeError as e:
-            # Starlette raises RuntimeError (not WebSocketDisconnect) when reading a socket
-            # that our side already closed, e.g. a handler closing between our check and read
-            if websocket.application_state == WebSocketState.DISCONNECTED:
-                closed_by_server = True
-                logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
-            else:
-                logger.error(f"WebSocket communication error for {client_info}: {str(e)}")
+                    if intent == INTENT_INTERRUPT:
+                        if run is None:
+                            await connection.send_json(control_status(STATUS_IDLE))
+                        else:
+                            logger.info(f"Interrupt from {client_info}; cancelling handler")
+                            interrupted, run = run, None
+                            await self._cancel_run(interrupted, client_info)
+                            await connection.send_json(control_status(STATUS_INTERRUPTED))
+                    elif intent == INTENT_CLOSE:
+                        if run is None:
+                            close_code, close_reason = CloseCode.NORMAL, "Closed by client request"
+                            break
+                        logger.info(f"Close requested by {client_info}; closing after the running handler")
+                        client_close_requested = True
+                    elif run is not None:
+                        logger.info(f"Busy: rejecting message #{message_count} from {client_info}")
+                        await connection.send_json(control_error(ERROR_BUSY, "a message is already being processed"))
+                    else:
+                        logger.info(f"Processing message #{message_count} for {client_info}")
+                        run = self._start_run(connection, data, jwt_payload, jwt_token)
+
+        except (WebSocketDisconnect, ConnectionClosed):
+            logger.info(f"Client {client_info} disconnected after {message_count} messages")
+        except _ConnectionRejected as rejected:
+            close_code, close_reason = rejected.code, rejected.reason
         except asyncio.CancelledError:
-            close_code, close_reason = 1001, "Server shutting down"
+            close_code, close_reason = CloseCode.GOING_AWAY, "Server shutting down"
             raise
         except Exception as e:
-            logger.error(f"WebSocket communication error for {client_info}: {str(e)}")
+            logger.error(f"WebSocket communication error for {client_info}: {e!r}")
         finally:
+            self._discard_receive(receive_task)
             try:
-                if closed_by_server:
-                    await self._let_closing_tasks_finish(background_tasks)
+                if run is not None:
+                    await self._cancel_run(run, client_info)
             finally:
-                # Runs even if the server is cancelled during the grace wait
-                await self._cleanup_websocket_resources(client, background_tasks, client_info,
-                                                        websocket=websocket, close_code=close_code, close_reason=close_reason)
+                if connection.is_open:
+                    logger.info(f"Closing connection for {client_info}: {int(close_code)} {close_reason}")
+                await connection._close(close_code, close_reason)
 
-    async def _let_closing_tasks_finish(self, background_tasks: list):
-        """Give a task that closed the socket time to finish before cleanup cancels it.
+    def _start_run(self, connection: AgentConnection, data: str, jwt_payload, jwt_token) -> _HandlerRun:
+        client = TaskManagerAsyncClient()
+        task = asyncio.create_task(self.message_processor.process_message(
+            handler=self.handler,
+            app_config=self.config,
+            client=client,
+            connection=connection,
+            data=data,
+            jwt_payload=jwt_payload,
+            jwt_token=jwt_token
+        ))
+        return _HandlerRun(task=task, client=client, started_at=asyncio.get_running_loop().time())
 
-        Starlette marks the socket DISCONNECTED before the close frame is actually sent, so the
-        loop can see the close while the closing task is still sending it. Cancelling the task
-        then would drop the close frame.
-        """
-        pending = [task for task in background_tasks if not task.done()]
-        if pending:
-            await asyncio.wait(pending, timeout=SERVER_CLOSE_GRACE_SECONDS)
+    async def _finish_run(self, run: _HandlerRun, client_info: str) -> Optional[BaseException]:
+        """Release a finished run's resources; return the exception it raised, if any."""
+        await self._close_client(run.client, client_info)
+        return None if run.task.cancelled() else run.task.exception()
 
-    def _prune_tasks(self, background_tasks: list, client_info: str) -> list:
-        """Return the unfinished tasks, dropping finished ones so they release their websocket/payload."""
-        live = []
-        for task in background_tasks:
-            if not task.done():
-                live.append(task)
-            elif not task.cancelled() and task.exception() is not None:
-                # Retrieving the exception also avoids asyncio's "never retrieved" warning
-                logger.error(f"Handler task failed for {client_info}: {task.exception()!r}")
-        return live
-
-    async def _process_message_with_intent_handling(self, websocket: WebSocket, data: str, client, background_tasks: list, client_info: str, message_count: int, jwt_payload, jwt_token=None):
-        """Handle message processing with interrupt intent logic"""
+    async def _cancel_run(self, run: _HandlerRun, client_info: str):
+        """Cancel a handler and give it HANDLER_UNWIND_GRACE_SECONDS to unwind, then abandon it."""
+        run.task.cancel()
         try:
-            message_obj = json.loads(data)
-            message_intent = message_obj[0].get("http://vital.ai/ontology/vital-aimp#hasIntent", None)
-            
-            if message_intent == "interrupt":
-                logger.info(f"Processing interrupted by client {client_info}")
-                client.log_current_tasks()
-                await client.cancel_current_tasks()
-                for task in background_tasks:
-                    task.cancel()
-                try:
-                    await asyncio.gather(*background_tasks, return_exceptions=True)
-                except Exception as e:
-                    logger.error(f"Error in interrupt gather for {client_info}: {e}")
-                try:
-                    if client.ws_active and self._ws_open(websocket):
-                        await websocket.close()
-                        client._ws_active = False
-                except Exception as e:
-                    logger.error(f"Error in interrupt websocket close for {client_info}: {e}")
-                return
-            
-            if any(not task.done() for task in background_tasks):
-                logger.info(f"Currently processing task for {client_info}, ignoring new request")
-                if self._ws_open(websocket):
-                    await websocket.send_text("processing task. ignoring message.")
+            await run.client.cancel_current_tasks()
+        except Exception as e:
+            logger.error(f"Error canceling client tasks for {client_info}: {e!r}")
+        try:
+            await asyncio.wait({run.task}, timeout=HANDLER_UNWIND_GRACE_SECONDS)
+        finally:
+            if run.task.done():
+                self._retrieve_exception(run.task)
+                await self._close_client(run.client, client_info)
             else:
-                logger.info(f"Processing message #{message_count} for {client_info}")
-                started_event = asyncio.Event()
-                task = asyncio.create_task(self.process_ws_message(websocket=websocket, data=data, started_event=started_event, jwt_payload=jwt_payload, jwt_token=jwt_token, client_info=client_info))
-                background_tasks.append(task)
-                # Wait until the handler signals it has started, OR the task finishes.
-                # Waiting on started_event alone would hang forever (leaking the
-                # connection + decoded payload) if the task errors before setting it.
-                started_waiter = asyncio.ensure_future(started_event.wait())
-                try:
-                    await asyncio.wait({started_waiter, task}, return_when=asyncio.FIRST_COMPLETED)
-                finally:
-                    started_waiter.cancel()
-                logger.info(f"Handler started for message #{message_count} for {client_info}")
-                return
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in message from {client_info}: {str(e)}")
-            if self._ws_open(websocket):
-                await websocket.close(code=1003, reason="Invalid JSON")
-            return
-        except Exception as e:
-            logger.error(f"Message processing error for {client_info}: {str(e)}")
-            if self._ws_open(websocket):
-                await websocket.close(code=1011, reason="Message processing failed")
-            return
+                logger.error(f"Cancelled handler for {client_info} did not finish within "
+                             f"{HANDLER_UNWIND_GRACE_SECONDS}s; abandoning it")
+                self._abandoned_tasks.add(run.task)
+                run.task.add_done_callback(self._forget_abandoned_task)
 
-    async def _cleanup_websocket_resources(self, client, background_tasks: list, client_info: str,
-                                           websocket: WebSocket = None, close_code: int = 1000, close_reason: str = ""):
-        """Clean up WebSocket resources including TaskManagerAsyncClient and background tasks"""
-        # Log failures of tasks that already finished; the gather below discards exceptions.
-        # This is the only prune when the handler closed the socket (the loop exits without one).
-        background_tasks[:] = self._prune_tasks(background_tasks, client_info)
-
-        # Clean up background tasks
-        if background_tasks:
-            try:
-                for task in background_tasks:
-                    task.cancel()
-                await asyncio.gather(*background_tasks, return_exceptions=True)
-            except Exception as e:
-                logger.error(f"Error in final gather for {client_info}: {e}")
-        
-        # Cancel any remaining tasks in client
+    @staticmethod
+    async def _close_client(client: TaskManagerAsyncClient, client_info: str):
         try:
-            if client:
-                await client.cancel_current_tasks()
+            await client.aclose()
         except Exception as e:
-            logger.error(f"Error canceling tasks for {client_info}: {e}")
+            logger.warning(f"Error closing HTTP client for {client_info}: {e!r}")
 
-        # Close the socket if nothing else has (idle timeout, rejection, unexpected error)
-        if websocket is not None and self._ws_open(websocket):
-            try:
-                await websocket.close(code=close_code, reason=close_reason)
-            except Exception as e:
-                logger.warning(f"Error closing WebSocket for {client_info}: {e}")
+    def _forget_abandoned_task(self, task: asyncio.Task):
+        self._abandoned_tasks.discard(task)
+        self._retrieve_exception(task)
+
+    @staticmethod
+    def _retrieve_exception(task: asyncio.Task):
+        """What a cancelled handler raises while unwinding is not a new failure; retrieve it
+        so asyncio doesn't log "exception was never retrieved"."""
+        if not task.cancelled():
+            task.exception()
+
+    @staticmethod
+    def _discard_receive(receive_task):
+        if receive_task is None:
+            return
+        if receive_task.done():
+            if not receive_task.cancelled():
+                receive_task.exception()
+        else:
+            receive_task.cancel()

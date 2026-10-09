@@ -1,166 +1,129 @@
-"""WebSocket connection-lifecycle tests: normal close, multi-message, idle timeout, task deadline.
+"""WebSocket protocol tests (Contract v2): the SDK owns the socket, either side signals close,
+the loop always reads, and every outcome has its own close code.
 
-See planning/websocket-connection-lifecycle-hardening.md.
+See README "WebSocket protocol" and planning/websocket-connection-lifecycle-hardening.md.
 """
 import asyncio
-import gc
 import json
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock
 
 import jwt
 import pytest
 from starlette.testclient import TestClient
-from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from vital_agent_container import agent_container_app
 from vital_agent_container.agent_container_app import AgentContainerApp
+from vital_agent_container.connection import ConnectionClosed
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
+from vital_agent_container.protocol import CloseCode
 
 
 LOGGER_NAME = "VitalAgentContainerLogger"
 SECRET = "test-secret-key"
-NOT_CONNECTED = "WebSocket is not connected"
 
 
 # ── Test handler and app ─────────────────────────────────────
 
 class ScriptedHandler(AIMPMessageHandlerInf):
-    """Runs `behavior(websocket, started_event)` for every message."""
+    """Runs `behavior(connection, data)` for every message."""
 
     def __init__(self, behavior):
         self.behavior = behavior
         self.finally_ran = threading.Event()
+        self.calls = 0
 
-    async def process_message(self, *, websocket, started_event, **kwargs):
+    async def process_message(self, *, connection, data, **kwargs):
+        self.calls += 1
         try:
-            await self.behavior(websocket, started_event)
+            await self.behavior(connection, data)
         finally:
             self.finally_ran.set()
 
 
 class ObservedApp(AgentContainerApp):
-    """Signals when a connection's cleanup has finished, so tests can assert on logs."""
+    """Signals when a connection has fully ended, so tests can assert on logs."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.connection_done = threading.Event()
 
-    async def _cleanup_websocket_resources(self, *args, **kwargs):
+    async def _run_connection(self, *args, **kwargs):
         try:
-            await super()._cleanup_websocket_resources(*args, **kwargs)
+            await super()._run_connection(*args, **kwargs)
         finally:
             self.connection_done.set()
 
 
 # Handler behaviors
 
-async def close_then_signal(ws, started):
-    """cardiff's pattern: reply, close, then signal (the original bug trigger)."""
-    await ws.send_text("reply")
-    await ws.close()
-    started.set()
+async def reply(connection, data):
+    await connection.send_text("reply")
 
 
-async def signal_then_close(ws, started):
-    started.set()
-    await asyncio.sleep(0.05)
-    await ws.send_text("reply")
-    await ws.close()
+async def reply_and_request_close(connection, data):
+    await connection.send_text("reply")
+    connection.request_close()
 
 
-async def reply_only(ws, started):
-    await ws.send_text("reply")
-    started.set()
+async def slow_reply(connection, data):
+    await asyncio.sleep(0.4)
+    await connection.send_text("reply")
 
 
-async def slow_reply(ws, started):
-    started.set()
-    await asyncio.sleep(0.6)
-    await ws.send_text("reply")
+async def hang_if_asked(connection, data):
+    if "hang" in data:
+        await asyncio.Event().wait()
+    await connection.send_text("reply")
 
 
-async def hang_without_signal(ws, started):
+async def hang(connection, data):
     await asyncio.Event().wait()
 
 
-async def hang_then_close_in_finally(ws, started):
+async def hang_then_send_in_cleanup(connection, data):
     try:
         await asyncio.Event().wait()
     finally:
-        await ws.close()
-        started.set()
+        await connection.send_text("late")  # raises ConnectionClosed once the SDK has closed
 
 
-async def signal_then_hang(ws, started):
-    started.set()
-    await asyncio.Event().wait()
+send_errors = []
 
 
-async def close_signal_then_raise(ws, started):
-    """cardiff's error path: reply, close and signal in finally, then re-raise."""
-    try:
-        raise ValueError("handler blew up")
-    finally:
-        await ws.send_text("reply")
-        await ws.close()
-        started.set()
-
-
-post_close_done = threading.Event()
-
-
-async def close_signal_then_short_work(ws, started):
-    await ws.send_text("reply")
-    await ws.close()
-    started.set()
-    await asyncio.sleep(0.1)  # e.g. persisting after the reply
-    post_close_done.set()
-
-
-receive_text_calls = []
-
-
-async def signal_close_then_short_work(ws, started):
-    """Early-signalling handler: the loop is reading while it closes, so the
-    client's reply to our close arrives as a disconnect."""
-    started.set()
-    # Wait until the loop is inside its second receive_text() (needs the spy below)
-    for _ in range(1000):
-        if len(receive_text_calls) >= 2:
-            break
-        await asyncio.sleep(0.002)
-    else:
-        raise AssertionError("receive loop never re-entered receive_text()")
-    await ws.send_text("reply")
-    await ws.close()
-    await asyncio.sleep(0.1)
-    post_close_done.set()
-
-
-async def close_signal_then_hang(ws, started):
-    await ws.send_text("reply")
-    await ws.close()
-    started.set()
-    await asyncio.Event().wait()
-
-
-async def hang_swallowing_cancel(ws, started):
+async def hang_then_record_send_error(connection, data):
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
-        return  # swallowed: the deadline's TimeoutError never propagates
+        try:
+            await connection.send_text("late")
+        except ConnectionClosed as e:
+            send_errors.append(e)
+        raise
 
 
-async def signal_then_raise(ws, started):
-    await ws.send_text("reply")
-    started.set()
+async def raise_error(connection, data):
+    await connection.send_text("reply")
     raise ValueError("handler blew up")
 
 
-# ── JWT modes ────────────────────────────────────────────────
+async def raise_own_timeout(connection, data):
+    raise TimeoutError("handler's own deadline")
+
+
+slow_unwind_done = threading.Event()
+
+
+async def hang_then_slow_unwind(connection, data):
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await asyncio.sleep(1.0)  # e.g. a slow cleanup call; swallows the cancellation
+        slow_unwind_done.set()
+
+
+# ── JWT modes and helpers ────────────────────────────────────
 
 def _token(sub="test-user"):
     now = datetime.now(timezone.utc)
@@ -186,11 +149,11 @@ def _connect_kwargs(mode):
     return {}
 
 
-def _message(mode, intent=None):
-    obj = {"type": "test"}
+def _message(mode="disabled", intent=None, text="hello", jwt_in_payload=True):
+    obj = {"type": "test", "text": text}
     if intent:
         obj["http://vital.ai/ontology/vital-aimp#hasIntent"] = intent
-    if mode == "payload":
+    if mode == "payload" and jwt_in_payload:
         obj["http://vital.ai/ontology/vital-aimp#hasJwtJSON"] = json.dumps({"jwt_token": _token()})
     return json.dumps([obj])
 
@@ -201,8 +164,12 @@ def make_app(behavior, mode="disabled", **timeouts):
     return app, handler
 
 
+def connect(app, mode="disabled"):
+    return TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode))
+
+
 def wait_done(app, timeout=5):
-    assert app.connection_done.wait(timeout), "connection was not cleaned up"
+    assert app.connection_done.wait(timeout), "connection did not end"
 
 
 def receive_close(ws):
@@ -210,6 +177,12 @@ def receive_close(ws):
     msg = ws.receive()
     assert msg["type"] == "websocket.close", msg
     return msg.get("code"), msg.get("reason")
+
+
+def receive_control(ws):
+    msg = json.loads(ws.receive_text())
+    assert isinstance(msg, dict), msg
+    return msg
 
 
 @pytest.fixture
@@ -229,314 +202,340 @@ def infos(caplog):
 ALL_MODES = ["disabled", "header", "payload"]
 
 
-# ── Gap 3: no ERROR on normal close ──────────────────────────
+# ── Closing: either side signals, the SDK closes ─────────────
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_handler_close_before_signal_logs_no_error(logs, mode):
-    app, handler = make_app(close_then_signal, mode)
-    with TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode)) as ws:
+def test_service_request_close_closes_1000_after_reply(logs, mode):
+    app, _ = make_app(reply_and_request_close, mode)
+    with connect(app, mode) as ws:
         ws.send_text(_message(mode))
         assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
-        wait_done(app)
-
-    assert errors(logs) == []
-    assert any("closed by server" in m for m in infos(logs))
-
-
-def test_handler_close_after_signal_logs_no_error(logs):
-    app, _ = make_app(signal_then_close)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
-        ws.close()
+        assert receive_close(ws) == (CloseCode.NORMAL, "Closed by service")
         wait_done(app)
 
     assert errors(logs) == []
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_client_close_logs_disconnected_normally(logs, mode):
-    app, _ = make_app(reply_only, mode)
-    with TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode)) as ws:
+def test_client_close_intent_when_idle_closes_1000(logs, mode):
+    app, _ = make_app(reply, mode)
+    with connect(app, mode) as ws:
         ws.send_text(_message(mode))
         assert ws.receive_text() == "reply"
-        ws.close()
+        ws.send_text(_message(mode, intent="close"))
+        assert receive_close(ws) == (CloseCode.NORMAL, "Closed by client request")
         wait_done(app)
 
     assert errors(logs) == []
-    assert any("disconnected normally" in m for m in infos(logs))
 
 
-def test_genuine_fault_still_logs_error(logs):
-    app, _ = make_app(reply_only)
-
-    async def boom(*args, **kwargs):
-        raise RuntimeError("boom")
-
-    with patch.object(app, "_process_message_with_intent_handling", boom):
-        with TestClient(app).websocket_connect("/ws") as ws:
-            ws.send_text(_message("disabled"))
-            assert receive_close(ws) == (1011, "Internal server error")
-            wait_done(app)
-
-    assert any("WebSocket communication error" in m and "boom" in m for m in errors(logs))
-
-
-def test_invalid_json_has_no_trailing_not_connected_error(logs):
-    app, _ = make_app(reply_only)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text("not json")
-        assert receive_close(ws) == (1003, "Invalid JSON")
-        wait_done(app)
-
-    errs = errors(logs)
-    assert any("Invalid JSON" in m for m in errs)
-    assert not any(NOT_CONNECTED in m or "communication error" in m for m in errs)
-
-
-def test_interrupt_cancels_in_flight_handler(logs):
-    app, handler = make_app(signal_then_hang)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        ws.send_text(_message("disabled", intent="interrupt"))
-        assert handler.finally_ran.wait(5)
-        ws.close()
-        wait_done(app)
-
-    assert not any(NOT_CONNECTED in m or "communication error" in m for m in errors(logs))
-
-
-# ── Gap 1: pruning / multi-message ───────────────────────────
-
-@pytest.mark.parametrize("mode", ALL_MODES)
-def test_multi_message_connection_processes_every_message(logs, mode):
-    app, _ = make_app(reply_only, mode)
-    with TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode)) as ws:
-        for _ in range(3):
-            ws.send_text(_message(mode))
-            assert ws.receive_text() == "reply"
-        ws.close()
-        wait_done(app)
-
-    assert errors(logs) == []
-    assert any("after 3 messages" in m for m in infos(logs))
-
-
-def test_message_during_in_flight_task_is_rejected(logs):
+def test_client_close_intent_while_running_waits_for_handler(logs):
     app, _ = make_app(slow_reply)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "processing task. ignoring message."
-        assert ws.receive_text() == "reply"
+    with connect(app) as ws:
+        ws.send_text(_message())
+        ws.send_text(_message(intent="close"))
+        assert ws.receive_text() == "reply"  # the running handler finishes first
+        assert receive_close(ws) == (CloseCode.NORMAL, "Closed by client request")
+        wait_done(app)
+
+    assert errors(logs) == []
+
+
+def test_handler_finishing_does_not_close_the_connection(logs):
+    app, handler = make_app(reply)
+    with connect(app) as ws:
+        for _ in range(3):
+            ws.send_text(_message())
+            assert ws.receive_text() == "reply"
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    assert handler.calls == 3
+    assert errors(logs) == []
+
+
+def test_client_disconnect_while_running_cancels_handler(logs):
+    send_errors.clear()
+    app, handler = make_app(hang_then_record_send_error)
+    with connect(app) as ws:
+        ws.send_text(_message())
         ws.close()
         wait_done(app)
 
+    assert handler.finally_ran.is_set()
+    assert len(send_errors) == 1  # sends after the client left raise ConnectionClosed
+    assert errors(logs) == []
+    assert any("disconnected" in m for m in infos(logs))
 
-def test_each_failed_task_is_logged_exactly_once(logs):
-    app, _ = make_app(signal_then_raise)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        ws.send_text(_message("disabled"))  # the loop prunes the first failed task
-        assert ws.receive_text() == "reply"
+
+def test_client_disconnect_while_idle(logs):
+    app, _ = make_app(reply)
+    with connect(app) as ws:
         ws.close()
         wait_done(app)
-    gc.collect()
 
-    # One per message: the first is pruned by the loop, the second by cleanup
-    failed = [m for m in errors(logs) if "Handler task failed" in m]
-    assert len(failed) == 2 and all("handler blew up" in m for m in failed)
-    assert not any("never retrieved" in r.getMessage() for r in logs.records)
+    assert errors(logs) == []
 
 
-def test_failed_task_is_logged_when_handler_closed_the_socket(logs):
-    app, _ = make_app(close_signal_then_raise)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
+# ── The loop always reads: busy and interrupt ────────────────
+
+def test_message_while_running_gets_busy_control_message(logs):
+    app, handler = make_app(slow_reply)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        ws.send_text(_message())
+        assert receive_control(ws) == {"type": "sdk.error", "error": "busy",
+                                       "detail": "a message is already being processed"}
         assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
 
-    failed = [m for m in errors(logs) if "Handler task failed" in m]
+    assert handler.calls == 1
+
+
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_interrupt_cancels_handler_and_keeps_connection_open(logs, mode):
+    app, handler = make_app(hang_if_asked, mode)
+    with connect(app, mode) as ws:
+        ws.send_text(_message(mode, text="hang"))
+        ws.send_text(_message(mode, intent="interrupt"))
+        assert receive_control(ws) == {"type": "sdk.status", "status": "interrupted"}
+        assert handler.finally_ran.is_set()
+
+        ws.send_text(_message(mode))  # the connection is still usable
+        assert ws.receive_text() == "reply"
+        ws.send_text(_message(mode, intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    assert errors(logs) == []
+
+
+def test_interrupt_while_idle_reports_idle(logs):
+    app, handler = make_app(reply)
+    with connect(app) as ws:
+        ws.send_text(_message(intent="interrupt"))
+        assert receive_control(ws) == {"type": "sdk.status", "status": "idle"}
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
+        wait_done(app)
+
+    assert handler.calls == 0
+
+
+# ── Errors ───────────────────────────────────────────────────
+
+def test_handler_error_closes_1011(logs):
+    app, _ = make_app(raise_error)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        assert ws.receive_text() == "reply"
+        assert receive_close(ws) == (CloseCode.INTERNAL_ERROR, "Handler error")
+        wait_done(app)
+
+    failed = [m for m in errors(logs) if "Handler failed" in m]
     assert len(failed) == 1 and "handler blew up" in failed[0]
-    assert not any(NOT_CONNECTED in m or "communication error" in m for m in errors(logs))
 
 
-# ── Close grace period ───────────────────────────────────────
-
-def test_post_close_work_within_grace_completes(logs):
-    post_close_done.clear()
-    app, handler = make_app(close_signal_then_short_work)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
+def test_handler_own_timeout_error_is_a_handler_error_not_4008(logs):
+    app, _ = make_app(raise_own_timeout, ws_task_timeout=10)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        assert receive_close(ws) == (CloseCode.INTERNAL_ERROR, "Handler error")
         wait_done(app)
 
-    assert post_close_done.is_set()
-    assert errors(logs) == []
 
-
-def test_post_close_work_within_grace_completes_for_early_signal(logs, monkeypatch):
-    post_close_done.clear()
-    receive_text_calls.clear()
-    disconnect_raised = threading.Event()
-    original_receive_text = WebSocket.receive_text
-
-    async def spy_receive_text(self):
-        receive_text_calls.append(True)  # counted before the state check, which is synchronous
-        try:
-            return await original_receive_text(self)
-        except WebSocketDisconnect:
-            disconnect_raised.set()
-            raise
-
-    monkeypatch.setattr(WebSocket, "receive_text", spy_receive_text)
-    app, handler = make_app(signal_close_then_short_work)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
-        ws.close()  # the client answers our close with a disconnect
+def test_invalid_json_closes_1003(logs):
+    app, handler = make_app(reply)
+    with connect(app) as ws:
+        ws.send_text("not json")
+        assert receive_close(ws) == (CloseCode.UNSUPPORTED_DATA, "Invalid JSON")
         wait_done(app)
 
-    assert disconnect_raised.is_set(), "loop did not exit via WebSocketDisconnect"
-    assert post_close_done.is_set()
-    assert errors(logs) == []
+    assert handler.calls == 0
 
 
-def test_post_close_work_beyond_grace_is_cancelled(logs, monkeypatch):
-    monkeypatch.setattr(agent_container_app, "SERVER_CLOSE_GRACE_SECONDS", 0.2)
-    app, handler = make_app(close_signal_then_hang)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        assert receive_close(ws)[0] == 1000
+def test_non_aimp_message_closes_1003(logs):
+    app, handler = make_app(reply)
+    with connect(app) as ws:
+        ws.send_text(json.dumps({"not": "a list"}))
+        assert receive_close(ws) == (CloseCode.UNSUPPORTED_DATA, "Invalid message")
         wait_done(app)
 
-    assert handler.finally_ran.is_set()
-    # AIMPMessageProcessor logs every cancellation as "Canceling" at ERROR (pre-existing)
-    assert [m for m in errors(logs) if not m.startswith("Canceling")] == []
+    assert handler.calls == 0
 
 
-async def test_cancel_during_grace_wait_still_cleans_up():
-    app, _ = make_app(reply_only)
-    websocket = MagicMock()
-    websocket.application_state = WebSocketState.DISCONNECTED  # loop exits as "closed by server"
-    websocket.client_state = WebSocketState.DISCONNECTED
+def test_payload_mode_without_jwt_closes_4001(logs):
+    app, handler = make_app(reply, "payload")
+    with connect(app, "payload") as ws:
+        ws.send_text(_message("payload", jwt_in_payload=False))
+        assert receive_close(ws) == (CloseCode.UNAUTHORIZED, "JWT token required in message payload")
+        wait_done(app)
 
-    async def cancelled_grace(background_tasks):
-        raise asyncio.CancelledError  # server shutting down mid-wait
-
-    cleaned_up = []
-
-    async def cleanup(*args, **kwargs):
-        cleaned_up.append(True)
-
-    with patch.object(app, "_let_closing_tasks_finish", cancelled_grace), \
-            patch.object(app, "_cleanup_websocket_resources", cleanup):
-        with pytest.raises(asyncio.CancelledError):
-            await app._run_receive_loop(websocket, "test", get_jwt=None)
-
-    assert cleaned_up == [True]
+    assert handler.calls == 0
 
 
-# ── Gap 2: idle timeout ──────────────────────────────────────
+def test_payload_mode_checks_jwt_before_parsing(logs):
+    """JWT handling is unchanged by contract v2: in payload mode a malformed message fails the
+    JWT check (4001) before it is parsed (which would give 1003)."""
+    app, handler = make_app(reply, "payload")
+    with connect(app, "payload") as ws:
+        ws.send_text("not json")
+        assert receive_close(ws)[0] == CloseCode.UNAUTHORIZED
+        wait_done(app)
+
+    assert handler.calls == 0
+
+
+@pytest.mark.parametrize("intent", ["interrupt", "close"])
+def test_payload_mode_requires_jwt_on_control_intents(logs, intent):
+    app, _ = make_app(reply, "payload")
+    with connect(app, "payload") as ws:
+        ws.send_text(_message("payload", intent=intent, jwt_in_payload=False))
+        assert receive_close(ws) == (CloseCode.UNAUTHORIZED, "JWT token required in message payload")
+        wait_done(app)
+
+
+# ── Idle timeout ─────────────────────────────────────────────
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_idle_connection_is_closed(logs, mode):
-    app, _ = make_app(reply_only, mode, ws_idle_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode)) as ws:
-        assert receive_close(ws) == (1000, "Idle timeout")
-        wait_done(app)
-
-    assert errors(logs) == []
-    assert any("Idle timeout" in m for m in infos(logs))
-
-
-def test_idle_timeout_after_last_message(logs):
-    app, _ = make_app(reply_only, ws_idle_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"
-        assert receive_close(ws) == (1000, "Idle timeout")
-        wait_done(app)
-
-    assert any("Idle timeout" in m and "after 1 messages" in m for m in infos(logs))
-
-
-def test_idle_timeout_does_not_cancel_running_handler(logs):
-    app, handler = make_app(slow_reply, ws_idle_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert ws.receive_text() == "reply"  # handler outlived several idle periods
-        assert receive_close(ws) == (1000, "Idle timeout")
+def test_idle_connection_is_closed_1000(logs, mode):
+    app, _ = make_app(reply, mode, ws_idle_timeout=0.2)
+    with connect(app, mode) as ws:
+        assert receive_close(ws) == (CloseCode.NORMAL, "Idle timeout")
         wait_done(app)
 
     assert errors(logs) == []
 
 
-# ── Gap 4: per-task deadline ─────────────────────────────────
+def test_idle_timer_does_not_run_while_handler_runs(logs):
+    app, _ = make_app(slow_reply, ws_idle_timeout=0.2)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        assert ws.receive_text() == "reply"  # the 0.4s handler outlived the 0.2s idle timeout
+        assert receive_close(ws) == (CloseCode.NORMAL, "Idle timeout")
+        wait_done(app)
+
+    assert errors(logs) == []
+
+
+# ── Task deadline ────────────────────────────────────────────
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_hung_handler_is_cancelled_and_closed_1011(logs, mode):
-    app, handler = make_app(hang_without_signal, mode, ws_task_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws", **_connect_kwargs(mode)) as ws:
+def test_deadline_closes_4008_and_cancels_handler(logs, mode):
+    app, handler = make_app(hang, mode, ws_task_timeout=0.2)
+    with connect(app, mode) as ws:
         ws.send_text(_message(mode))
-        assert receive_close(ws) == (1011, "Handler timeout")
+        assert receive_close(ws) == (CloseCode.HANDLER_TIMEOUT, "Handler timeout")
         wait_done(app)
 
     assert handler.finally_ran.is_set()
-    errs = errors(logs)
-    assert any("deadline" in m for m in errs)
-    assert not any(NOT_CONNECTED in m or "communication error" in m for m in errs)
-
-
-def test_deadline_1011_wins_over_handler_close_in_finally(logs):
-    """cardiff-style handler closes (1000) in its cleanup; the SDK closes with 1011 first."""
-    app, handler = make_app(hang_then_close_in_finally, ws_task_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert receive_close(ws) == (1011, "Handler timeout")
-        wait_done(app)
-
-    assert handler.finally_ran.is_set()
-
-    assert not any(NOT_CONNECTED in m or "communication error" in m or "Error closing" in m
-                   for m in errors(logs) + infos(logs))
-
-
-def test_deadline_fires_even_if_handler_swallows_cancellation(logs):
-    app, _ = make_app(hang_swallowing_cancel, ws_task_timeout=0.2)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert receive_close(ws) == (1011, "Handler timeout")
-        wait_done(app)
-
     assert any("deadline" in m for m in errors(logs))
 
 
-def test_hung_handler_after_signal_is_closed_by_deadline(logs):
-    app, _ = make_app(signal_then_hang, ws_idle_timeout=0.2, ws_task_timeout=0.4)
-    with TestClient(app).websocket_connect("/ws") as ws:
-        ws.send_text(_message("disabled"))
-        assert receive_close(ws) == (1011, "Handler timeout")
-        ws.close()
+def test_deadline_4008_is_sent_before_handler_cleanup_runs(logs):
+    app, handler = make_app(hang_then_send_in_cleanup, ws_task_timeout=0.2)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        # The close comes first; the handler's cleanup send fails with ConnectionClosed
+        assert receive_close(ws) == (CloseCode.HANDLER_TIMEOUT, "Handler timeout")
+        wait_done(app)
+
+    assert handler.finally_ran.is_set()
+
+
+def test_slow_unwinding_handler_is_abandoned_after_grace(logs, monkeypatch):
+    monkeypatch.setattr(agent_container_app, "HANDLER_UNWIND_GRACE_SECONDS", 0.2)
+    slow_unwind_done.clear()
+    app, _ = make_app(hang_then_slow_unwind, ws_task_timeout=0.2)
+    with connect(app) as ws:
+        ws.send_text(_message())
+        assert receive_close(ws) == (CloseCode.HANDLER_TIMEOUT, "Handler timeout")
+        # The connection ends without waiting out the handler's 1s unwind
+        wait_done(app, timeout=0.9)
+        assert not slow_unwind_done.is_set()
+        assert any("abandoning" in m for m in errors(logs))
+
+        # The abandoned task is tracked until it finishes, then forgotten
+        assert slow_unwind_done.wait(3)
+        for _ in range(100):
+            if not app._abandoned_tasks:
+                break
+            threading.Event().wait(0.01)
+        assert not app._abandoned_tasks
+
+
+def test_deadline_disabled_with_zero(logs):
+    app, _ = make_app(slow_reply, ws_task_timeout=0)
+    assert app.ws_task_timeout is None
+    with connect(app) as ws:
+        ws.send_text(_message())
+        assert ws.receive_text() == "reply"
+        ws.send_text(_message(intent="close"))
+        assert receive_close(ws)[0] == CloseCode.NORMAL
         wait_done(app)
 
 
-async def test_handler_own_timeout_error_is_not_swallowed():
-    async def own_deadline(ws, started):
-        raise TimeoutError("handler's own deadline")
+# ── Shutdown ─────────────────────────────────────────────────
 
-    app, _ = make_app(own_deadline, ws_task_timeout=10)
-    started = asyncio.Event()
-    with pytest.raises(TimeoutError, match="handler's own deadline"):
-        await app.process_ws_message(websocket=MagicMock(), data="[]", started_event=started)
-    assert started.is_set()
+class FakeWebSocket:
+    """Just enough of a Starlette WebSocket for driving _run_connection directly."""
+
+    def __init__(self, messages):
+        from starlette.websockets import WebSocketState
+        self.application_state = WebSocketState.CONNECTED
+        self.client_state = WebSocketState.CONNECTED
+        self._messages = asyncio.Queue()
+        for m in messages:
+            self._messages.put_nowait(m)
+        self.sent = []
+        self.closed_with = None
+        self.state = type("State", (), {})()
+
+    async def receive_text(self):
+        return await self._messages.get()  # blocks once the scripted messages run out
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+    async def close(self, code=1000, reason=""):
+        from starlette.websockets import WebSocketState
+        self.application_state = WebSocketState.DISCONNECTED
+        self.closed_with = (code, reason)
+
+
+async def test_shutdown_cancels_handler_and_closes_1001():
+    app, handler = make_app(hang)
+    websocket = FakeWebSocket([_message()])
+
+    async def no_jwt(data):
+        return None, None
+
+    connection_task = asyncio.create_task(app._run_connection(websocket, "test", no_jwt))
+    for _ in range(100):  # wait until the handler is running
+        if handler.calls:
+            break
+        await asyncio.sleep(0.01)
+    connection_task.cancel()  # what the server does on shutdown
+    with pytest.raises(asyncio.CancelledError):
+        await connection_task
+
+    assert handler.finally_ran.is_set()
+    assert websocket.closed_with == (CloseCode.GOING_AWAY, "Server shutting down")
+
+
+# ── Contract constants ───────────────────────────────────────
+
+def test_close_codes_are_stable():
+    """Clients match on these codes; changing one is a breaking change."""
+    assert CloseCode.NORMAL == 1000
+    assert CloseCode.GOING_AWAY == 1001
+    assert CloseCode.UNSUPPORTED_DATA == 1003
+    assert CloseCode.INTERNAL_ERROR == 1011
+    assert CloseCode.UNAUTHORIZED == 4001
+    assert CloseCode.HANDLER_TIMEOUT == 4008
 
 
 # ── Configuration ────────────────────────────────────────────
@@ -544,7 +543,7 @@ async def test_handler_own_timeout_error_is_not_swallowed():
 def test_timeout_defaults(monkeypatch):
     monkeypatch.delenv("WS_IDLE_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("WS_TASK_TIMEOUT_SECONDS", raising=False)
-    app, _ = make_app(reply_only)
+    app, _ = make_app(reply)
     assert app.ws_idle_timeout == 300
     assert app.ws_task_timeout == 600
 
@@ -552,7 +551,7 @@ def test_timeout_defaults(monkeypatch):
 def test_timeouts_from_env(monkeypatch):
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "0")
-    app, _ = make_app(reply_only)
+    app, _ = make_app(reply)
     assert app.ws_idle_timeout == 45
     assert app.ws_task_timeout is None
 
@@ -561,14 +560,14 @@ def test_empty_env_uses_default(monkeypatch):
     """A template rendering a missing value as empty must not turn the timeouts off."""
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "")
     monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "  ")
-    app, _ = make_app(reply_only)
+    app, _ = make_app(reply)
     assert app.ws_idle_timeout == 300
     assert app.ws_task_timeout == 600
 
 
 def test_disabled_timeout_logs_warning(logs, monkeypatch):
     monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "0")
-    make_app(reply_only)
+    make_app(reply)
     warnings = [r.getMessage() for r in logs.records
                 if r.name == LOGGER_NAME and r.levelno == logging.WARNING]
     assert any("WS_TASK_TIMEOUT_SECONDS is 0" in m for m in warnings)
@@ -577,13 +576,13 @@ def test_disabled_timeout_logs_warning(logs, monkeypatch):
 def test_negative_timeout_is_rejected(monkeypatch):
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "-5")
     with pytest.raises(ValueError, match="WS_IDLE_TIMEOUT_SECONDS must be 0"):
-        make_app(reply_only)
+        make_app(reply)
 
 
 def test_kwargs_override_env_and_zero_disables(monkeypatch):
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("WS_TASK_TIMEOUT_SECONDS", "45")
-    app, _ = make_app(reply_only, ws_idle_timeout=0, ws_task_timeout=12)
+    app, _ = make_app(reply, ws_idle_timeout=0, ws_task_timeout=12)
     assert app.ws_idle_timeout is None
     assert app.ws_task_timeout == 12
 
@@ -591,4 +590,4 @@ def test_kwargs_override_env_and_zero_disables(monkeypatch):
 def test_invalid_env_timeout_fails_with_clear_error(monkeypatch):
     monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "5m")
     with pytest.raises(ValueError, match="WS_IDLE_TIMEOUT_SECONDS must be a number of seconds"):
-        make_app(reply_only)
+        make_app(reply)

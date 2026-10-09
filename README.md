@@ -89,47 +89,76 @@ app = AgentContainerApp(handler, app_config=config)
 
 2. Update the file with your specific configuration.
 
-### WebSocket connection lifecycle
+### WebSocket protocol
 
-A connection can carry any number of messages, one at a time. Either side may close the
-connection. A handler that closes the socket when it's done is a normal end and is logged at INFO.
+The container owns the WebSocket. Handlers never close it: either side **signals** that it's done,
+and the container does the actual close.
 
-When a handler closes the socket, the connection ends. A handler that keeps working after
-`close()` (persisting, logging, other cleanup) gets **5 seconds** to finish. After that it's
-cancelled. Do slow post-close work in a separate task you manage yourself. The 5s grace period is a
-fixed constant (`SERVER_CLOSE_GRACE_SECONDS` in `agent_container_app.py`), not configurable like the
-timeouts below.
+- **A connection carries any number of interactions, one at a time.** A handler finishing does not
+  end the connection.
+- **The service ends it** with `connection.request_close()` in the handler. The container closes
+  with 1000 once the handler has returned, so every reply has been sent first.
+- **The client ends it** by sending a message whose first object has
+  `"http://vital.ai/ontology/vital-aimp#hasIntent": "close"`. A running handler finishes first.
+  A plain WebSocket close or disconnect from the client cancels a running handler immediately.
+- **The container always reads**, even while a handler runs:
 
-The container doesn't read the next message until the handler sets `started_event`. When the
-handler sets it decides what happens next:
+| Client sends | No handler running | Handler running |
+|---|---|---|
+| an AIMP message (JSON list) | starts the handler | rejected: `{"type": "sdk.error", "error": "busy", ...}` |
+| intent `interrupt` | `{"type": "sdk.status", "status": "idle"}` | cancels the handler, then `{"type": "sdk.status", "status": "interrupted"}`; the connection stays open |
+| intent `close` | close 1000 | close 1000 after the handler returns |
+| invalid JSON / not an AIMP list | close 1003 | close 1003 (handler cancelled) |
 
-- **Set early** (when work starts): the container keeps reading while the handler runs. A message
-  that arrives in that time is rejected with `processing task. ignoring message.`, and an interrupt
-  message cancels the running handler.
-- **Set at the end** (e.g. in a `finally`): the container doesn't read during the handler run. A
-  new message waits until the handler finishes, and an interrupt can't arrive mid-run.
+Container control messages are JSON **objects**; AIMP payloads are JSON **lists**.
 
-Two timeouts bound how long a connection stays open:
+**JWT enforcement is unchanged by this protocol.** Header mode validates the token before the
+connection is accepted. Payload mode checks the JWT on **every** message, including `interrupt` and
+`close`, *before* the message is parsed. So in payload mode a message without a valid JWT closes with
+4001, even if it isn't valid JSON.
+
+**Close codes.** Clients match on the code (`vital_agent_container.protocol.CloseCode`). Reasons are
+informational.
+
+| Code | When |
+|---|---|
+| 1000 | closed on request (`Closed by service` / `Closed by client request`), or `Idle timeout` |
+| 4008 | `Handler timeout`: the handler exceeded `WS_TASK_TIMEOUT_SECONDS` |
+| 1011 | `Handler error` (the handler raised), or an unexpected container error |
+| 1003 | the message was not valid JSON or not an AIMP message list |
+| 4001 | JWT enforcement rejected the connection |
+| 1001 | `Server shutting down` |
+
+**Handler rules:**
+
+- Send with `await connection.send_text(...)` / `send_json(...)`. Once the connection has ended
+  (client left, timeout, interrupt cleanup), sends raise `ConnectionClosed`.
+- Return when the interaction is done. Call `connection.request_close()` first if the connection
+  should end.
+- A cancelled handler (interrupt, client disconnect, deadline, shutdown) gets 5 seconds
+  (`HANDLER_UNWIND_GRACE_SECONDS`) to unwind. After that it's logged at ERROR and abandoned. It keeps
+  running in the background until it finishes. Don't catch `CancelledError` to keep working.
+- On the deadline the container closes with 4008 *before* cancelling the handler. A handler can't
+  replace that with its own reply, so enforce a shorter deadline in the handler if you want to answer
+  timeouts yourself.
+
+**Timeouts:**
 
 | Env var | Constructor kwarg | Default | Effect |
 |---|---|---|---|
-| `WS_IDLE_TIMEOUT_SECONDS` | `ws_idle_timeout` | `300` | Closes the connection (code 1000, `Idle timeout`) after this long with no messages and no handler running. A running handler is never cancelled by this timeout. |
-| `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Closes the connection (code 1011, `Handler timeout`) and then cancels a handler that runs longer than this. Logged at ERROR. |
+| `WS_IDLE_TIMEOUT_SECONDS` | `ws_idle_timeout` | `300` | Closes with 1000 `Idle timeout` after this long with no handler running. Never cancels a handler. |
+| `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Closes with 4008 and cancels a handler that runs longer than this. Logged at ERROR. |
 
 - **Values:** plain seconds (`90`, `2.5`). Anything else (e.g. `5m`), or a negative number, raises
   `ValueError` when the app is constructed.
 - **Disabling:** only an explicit `0` turns a timeout off, and it logs a WARNING at startup. An empty
-  or unset variable uses the default, so a deploy template that renders a missing value as empty
-  can't turn the timeouts off by accident.
+  or unset variable uses the default.
 - **Precedence:** a constructor kwarg overrides the env var.
-
-On the task deadline, the 1011 close is sent *before* the handler is cancelled. If the handler then
-closes the socket in its own cleanup, that close is a no-op: the client still sees 1011, not 1000.
 
 `WS_TASK_TIMEOUT_SECONDS` is a backstop. Handlers should still enforce their own, shorter deadlines
 so they can send a proper error response.
 
-**The task deadline only bounds async work.** It fires by cancelling the handler, and a
+**The task deadline only bounds async work.** It cancels the handler (after closing with 4008), and a
 cancellation can only land while the handler is awaiting something. A handler stuck in blocking
 synchronous code (a sync HTTP or database client, CPU-bound work, `time.sleep`) is not interrupted.
 That code also blocks the event loop, so every connection's timers in the process stall until it
@@ -157,27 +186,27 @@ Python can't forcibly stop a thread, so bounding blocking work is the handler's 
 Create a custom message handler by implementing the `AIMPMessageHandlerInf` interface:
 
 ```python
+import json
 from vital_agent_container.handler.aimp_message_handler_inf import AIMPMessageHandlerInf
 from vital_agent_container.agent_container_app import AgentContainerApp
 
 class MyMessageHandler(AIMPMessageHandlerInf):
-    async def process_message(self, config, client, websocket, data, started_event):
-        # Your custom message processing logic here
-        # Process the incoming message data
+    async def process_message(self, *, app_config, client, connection, data,
+                              jwt_payload=None, jwt_token=None):
         message = json.loads(data)
-        
+
         # Perform your agent logic
         response = await self.handle_agent_request(message)
-        
-        # Send response back through websocket
-        await websocket.send_text(json.dumps(response))
-        
-        # Signal that processing has started
-        started_event.set()
-    
+
+        # Reply through the connection
+        await connection.send_json(response)
+
+        # Optional: end the connection after this interaction
+        connection.request_close()
+
     async def handle_agent_request(self, message):
         # Implement your specific agent logic here
-        return {"status": "processed", "result": "Agent response"}
+        return [{"type": "message", "content": "Agent response"}]
 
 # In your application's main module:
 def create_agent_app():
@@ -253,7 +282,9 @@ This project uses:
 
 ```
 ├── vital_agent_container/
-│   ├── agent_container_app.py      # Main FastAPI application
+│   ├── agent_container_app.py      # Main FastAPI application and connection loop
+│   ├── connection.py               # AgentConnection (handler-facing), ConnectionClosed
+│   ├── protocol.py                 # Wire contract: close codes, intents, control messages
 │   ├── handler/                    # Message handler interfaces
 │   ├── processor/                  # Message processing logic
 │   ├── tasks/                      # Task management

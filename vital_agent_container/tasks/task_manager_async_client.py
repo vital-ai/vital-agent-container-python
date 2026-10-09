@@ -10,11 +10,6 @@ class TaskManagerAsyncClient(httpx.AsyncClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._tasks: Dict[RequestTask, str] = {}
-        self._ws_active = None
-
-    @property
-    def ws_active(self):
-        return self._ws_active
 
     async def send(self, request, *args, **kwargs):
         is_streaming = kwargs.get("stream", False)
