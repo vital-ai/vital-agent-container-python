@@ -98,6 +98,23 @@ async def signal_then_hang(ws, started):
     await asyncio.Event().wait()
 
 
+async def close_signal_then_raise(ws, started):
+    """cardiff's error path: reply, close and signal in finally, then re-raise."""
+    try:
+        raise ValueError("handler blew up")
+    finally:
+        await ws.send_text("reply")
+        await ws.close()
+        started.set()
+
+
+async def hang_swallowing_cancel(ws, started):
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        return  # swallowed: the deadline's TimeoutError never propagates
+
+
 async def signal_then_raise(ws, started):
     await ws.send_text("reply")
     started.set()
@@ -279,20 +296,34 @@ def test_message_during_in_flight_task_is_rejected(logs):
         wait_done(app)
 
 
-def test_failed_task_exception_is_logged_once_when_pruned(logs):
+def test_each_failed_task_is_logged_exactly_once(logs):
     app, _ = make_app(signal_then_raise)
     with TestClient(app).websocket_connect("/ws") as ws:
         ws.send_text(_message("disabled"))
         assert ws.receive_text() == "reply"
-        ws.send_text(_message("disabled"))  # prunes the failed task
+        ws.send_text(_message("disabled"))  # the loop prunes the first failed task
         assert ws.receive_text() == "reply"
         ws.close()
         wait_done(app)
     gc.collect()
 
+    # One per message: the first is pruned by the loop, the second by cleanup
+    failed = [m for m in errors(logs) if "Handler task failed" in m]
+    assert len(failed) == 2 and all("handler blew up" in m for m in failed)
+    assert not any("never retrieved" in r.getMessage() for r in logs.records)
+
+
+def test_failed_task_is_logged_when_handler_closed_the_socket(logs):
+    app, _ = make_app(close_signal_then_raise)
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_text(_message("disabled"))
+        assert ws.receive_text() == "reply"
+        assert receive_close(ws)[0] == 1000
+        wait_done(app)
+
     failed = [m for m in errors(logs) if "Handler task failed" in m]
     assert len(failed) == 1 and "handler blew up" in failed[0]
-    assert not any("never retrieved" in r.getMessage() for r in logs.records)
+    assert not any(NOT_CONNECTED in m or "communication error" in m for m in errors(logs))
 
 
 # ── Gap 2: idle timeout ──────────────────────────────────────
@@ -357,6 +388,16 @@ def test_hung_handler_closing_in_finally_is_not_closed_twice(logs):
                    for m in errors(logs) + infos(logs))
 
 
+def test_deadline_fires_even_if_handler_swallows_cancellation(logs):
+    app, _ = make_app(hang_swallowing_cancel, ws_task_timeout=0.2)
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.send_text(_message("disabled"))
+        assert receive_close(ws) == (1011, "Handler timeout")
+        wait_done(app)
+
+    assert any("deadline" in m for m in errors(logs))
+
+
 def test_hung_handler_after_signal_is_closed_by_deadline(logs):
     app, _ = make_app(signal_then_hang, ws_idle_timeout=0.2, ws_task_timeout=0.4)
     with TestClient(app).websocket_connect("/ws") as ws:
@@ -401,3 +442,9 @@ def test_kwargs_override_env_and_zero_disables(monkeypatch):
     app, _ = make_app(reply_only, ws_idle_timeout=0, ws_task_timeout=12)
     assert app.ws_idle_timeout is None
     assert app.ws_task_timeout == 12
+
+
+def test_invalid_env_timeout_fails_with_clear_error(monkeypatch):
+    monkeypatch.setenv("WS_IDLE_TIMEOUT_SECONDS", "5m")
+    with pytest.raises(ValueError, match="WS_IDLE_TIMEOUT_SECONDS must be a number of seconds"):
+        make_app(reply_only)

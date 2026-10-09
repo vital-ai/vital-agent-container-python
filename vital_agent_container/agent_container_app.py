@@ -39,6 +39,9 @@ logger.addHandler(file_handler)
 
 service_identifier = AWSUtils.get_task_arn()
 
+# How long a handler task that closed the socket gets to finish before cleanup cancels it
+SERVER_CLOSE_GRACE_SECONDS = 5.0
+
 
 class _ConnectionRejected(Exception):
     """Raised by a receive loop's JWT step to end the connection with a specific close code."""
@@ -94,8 +97,13 @@ class AgentContainerApp(FastAPI):
             raw = os.getenv(env_var)
             if raw is None:
                 value = default
+            elif not raw.strip():
+                value = 0
             else:
-                value = float(raw) if raw.strip() else 0
+                try:
+                    value = float(raw)
+                except ValueError:
+                    raise ValueError(f"{env_var} must be a number of seconds, got {raw!r}") from None
         value = float(value)
         return value if value > 0 else None
 
@@ -180,28 +188,32 @@ class AgentContainerApp(FastAPI):
         # tighter deadlines so they can send a proper error response.
         deadline = asyncio.timeout(self.ws_task_timeout)
         try:
-            async with deadline:
-                await self.message_processor.process_message(
-                    handler=self.handler,
-                    app_config=self.config,
-                    client=client,
-                    websocket=websocket,
-                    data=data,
-                    started_event=started_event,
-                    jwt_payload=jwt_payload,
-                    jwt_token=jwt_token
-                )
-        except TimeoutError:
-            # A TimeoutError from the handler's own deadline is not ours to swallow
-            if not deadline.expired():
-                raise
-            logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelled")
-            await client.cancel_current_tasks()
-            if self._ws_open(websocket):
-                try:
-                    await websocket.close(code=1011, reason="Handler timeout")
-                except Exception as e:
-                    logger.warning(f"Error closing WebSocket after handler timeout for {client_info}: {e}")
+            try:
+                async with deadline:
+                    await self.message_processor.process_message(
+                        handler=self.handler,
+                        app_config=self.config,
+                        client=client,
+                        websocket=websocket,
+                        data=data,
+                        started_event=started_event,
+                        jwt_payload=jwt_payload,
+                        jwt_token=jwt_token
+                    )
+            except TimeoutError:
+                # A TimeoutError from the handler's own deadline is not ours to swallow
+                if not deadline.expired():
+                    raise
+            # Checked outside the except: a handler that swallows the CancelledError
+            # exits the block normally, but the deadline still fired
+            if deadline.expired():
+                logger.error(f"Handler exceeded {self.ws_task_timeout}s deadline for {client_info}; cancelled")
+                await client.cancel_current_tasks()
+                if self._ws_open(websocket):
+                    try:
+                        await websocket.close(code=1011, reason="Handler timeout")
+                    except Exception as e:
+                        logger.warning(f"Error closing WebSocket after handler timeout for {client_info}: {e}")
         finally:
             # Never leave the receive loop waiting on a handler that didn't signal
             started_event.set()
@@ -349,6 +361,7 @@ class AgentContainerApp(FastAPI):
         message_count = 0
         # Close used by cleanup if the socket is still open when the loop ends
         close_code, close_reason = 1011, "Internal server error"
+        closed_by_server = False
 
         try:
             # Exits once either side closes; a handler closing the socket is a normal end
@@ -375,6 +388,7 @@ class AgentContainerApp(FastAPI):
 
                 await self._process_message_with_intent_handling(websocket, data, client, background_tasks, client_info, message_count, jwt_payload, jwt_token)
             else:
+                closed_by_server = True
                 logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
 
         except WebSocketDisconnect:
@@ -383,6 +397,7 @@ class AgentContainerApp(FastAPI):
             # Starlette raises RuntimeError (not WebSocketDisconnect) when reading a socket
             # that our side already closed, e.g. a handler closing between our check and read
             if websocket.application_state == WebSocketState.DISCONNECTED:
+                closed_by_server = True
                 logger.info(f"WebSocket closed by server for {client_info} after {message_count} messages")
             else:
                 logger.error(f"WebSocket communication error for {client_info}: {str(e)}")
@@ -392,8 +407,21 @@ class AgentContainerApp(FastAPI):
         except Exception as e:
             logger.error(f"WebSocket communication error for {client_info}: {str(e)}")
         finally:
+            if closed_by_server:
+                await self._let_closing_tasks_finish(background_tasks)
             await self._cleanup_websocket_resources(client, background_tasks, client_info,
                                                     websocket=websocket, close_code=close_code, close_reason=close_reason)
+
+    async def _let_closing_tasks_finish(self, background_tasks: list):
+        """Give a task that closed the socket time to finish before cleanup cancels it.
+
+        Starlette marks the socket DISCONNECTED before the close frame is actually sent, so the
+        loop can see the close while the closing task is still sending it. Cancelling the task
+        then would drop the close frame.
+        """
+        pending = [task for task in background_tasks if not task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=SERVER_CLOSE_GRACE_SECONDS)
 
     def _prune_tasks(self, background_tasks: list, client_info: str) -> list:
         """Return the unfinished tasks, dropping finished ones so they release their websocket/payload."""
@@ -464,6 +492,10 @@ class AgentContainerApp(FastAPI):
     async def _cleanup_websocket_resources(self, client, background_tasks: list, client_info: str,
                                            websocket: WebSocket = None, close_code: int = 1000, close_reason: str = ""):
         """Clean up WebSocket resources including TaskManagerAsyncClient and background tasks"""
+        # Log failures of tasks that already finished; the gather below discards exceptions.
+        # This is the only prune when the handler closed the socket (the loop exits without one).
+        background_tasks[:] = self._prune_tasks(background_tasks, client_info)
+
         # Clean up background tasks
         if background_tasks:
             try:

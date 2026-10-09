@@ -91,10 +91,17 @@ app = AgentContainerApp(handler, app_config=config)
 
 ### WebSocket connection lifecycle
 
-A connection can carry any number of messages, one at a time. A message that arrives while the
-previous one is still being handled is rejected with `processing task. ignoring message.`.
-Either side may close the connection. A handler that closes the socket when it's done is a normal
-end and is logged at INFO.
+A connection can carry any number of messages, one at a time. Either side may close the
+connection. A handler that closes the socket when it's done is a normal end and is logged at INFO.
+
+The container doesn't read the next message until the handler sets `started_event`. When the
+handler sets it decides what happens next:
+
+- **Set early** (when work starts): the container keeps reading while the handler runs. A message
+  that arrives in that time is rejected with `processing task. ignoring message.`, and an interrupt
+  message cancels the running handler.
+- **Set at the end** (e.g. in a `finally`): the container doesn't read during the handler run. A
+  new message waits until the handler finishes, and an interrupt can't arrive mid-run.
 
 Two timeouts bound how long a connection stays open:
 
@@ -103,7 +110,9 @@ Two timeouts bound how long a connection stays open:
 | `WS_IDLE_TIMEOUT_SECONDS` | `ws_idle_timeout` | `300` | Closes the connection (code 1000, `Idle timeout`) after this long with no messages and no handler running. A running handler is never cancelled by this timeout. |
 | `WS_TASK_TIMEOUT_SECONDS` | `ws_task_timeout` | `600` | Cancels a handler that runs longer than this and closes the connection (code 1011, `Handler timeout`). Logged at ERROR. |
 
-Set either one to `0` (or empty) to disable it. A constructor kwarg overrides the env var.
+Set either one to `0` (or empty) to disable it. A constructor kwarg overrides the env var. Values
+are plain seconds (`90`, `2.5`). Anything else (e.g. `5m`) raises `ValueError` when the app is
+constructed.
 `WS_TASK_TIMEOUT_SECONDS` is a backstop. Handlers should still enforce their own, shorter deadlines
 so they can send a proper error response.
 
