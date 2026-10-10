@@ -27,9 +27,12 @@ class CloseCode(IntEnum):
     HANDLER_TIMEOUT = 4008    # handler exceeded WS_TASK_TIMEOUT_SECONDS
 
 
-# Control messages are JSON objects; AIMP payloads are JSON lists
+# A control message is a JSON object whose "type" is one of CONTROL_TYPES. Everything else sent
+# to the client is handler output: AIMP message lists, and handler-defined JSON objects such as
+# chunk frames ({"aimp_chunk": ...}). Classify by "type", never by "is it an object".
 CONTROL_ERROR = "sdk.error"
 CONTROL_STATUS = "sdk.status"
+CONTROL_TYPES = (CONTROL_STATUS, CONTROL_ERROR)
 
 ERROR_BUSY = "busy"              # a handler is running; wait for its done / interrupted
 ERROR_CANCELLING = "cancelling"  # interrupted handlers still running; wait for status ready
@@ -40,6 +43,11 @@ STATUS_IDLE = "idle"
 
 # AIMP objects carry their URI under this key; control messages echo the request's URI
 URI_PROPERTY = "URI"
+
+
+def is_control_message(obj: Any) -> bool:
+    """True for container control messages; False for handler output (lists, chunk frames, ...)."""
+    return isinstance(obj, dict) and obj.get("type") in CONTROL_TYPES
 
 
 def control_error(error: str, detail: str, in_reply_to: Optional[str] = None) -> Dict[str, Any]:

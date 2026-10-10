@@ -124,7 +124,14 @@ still validated first; see below.)
 interaction's `done` or `interrupted`. Both are guaranteed to arrive. After `cancelling`, wait for
 `ready`, which is sent exactly once when a request would be accepted again.
 
-Control messages are JSON **objects**; AIMP payloads are JSON **lists**. `in_reply_to` is a `URI`
+**What is a control message.** A control message is a JSON object whose `type` is `sdk.status` or
+`sdk.error` (`protocol.is_control_message`). Everything else the client receives is **handler
+output**: AIMP message lists, and any JSON objects the handler defines, such as chunk frames
+(`{"aimp_chunk": ...}`) for large replies. Clients must classify by `type`, not by "is it an
+object", or they'll swallow handler output. Handlers must not send objects with those two `type`
+values. Handler output always arrives before the interaction's `done`.
+
+`in_reply_to` is a `URI`
 taken from a request's first AIMP object (`null` if it has none). **Which request it names depends
 on the message:**
 
@@ -163,6 +170,13 @@ with a close request; wait for `done` first.
 sent within 5s (`CONTROL_SEND_TIMEOUT_SECONDS`), including any wait behind a handler send that's
 stuck because the client isn't reading. If not, the container logs a WARNING and closes with
 **1008** `Client not reading`, not 1011, because the server didn't fail.
+
+**Keep large handler frames well within that limit.** A control message waits for any handler
+frame already being sent. An `interrupt` during a large chunked reply therefore can't be answered
+with `interrupted` until the current frame is out. If one frame takes longer than 5s to send (a slow
+link, or a client that's slow to read), the connection is closed with 1008. Size chunk frames for
+the slowest expected link: for example, a ~700 KB frame needs a sustained ~150 KB/s or better.
+Don't raise a chunk-size setting without checking this.
 
 **JWT enforcement is unchanged by this protocol.** Header mode validates the token before the
 connection is accepted. Payload mode checks the JWT on **every** message, including `interrupt` and

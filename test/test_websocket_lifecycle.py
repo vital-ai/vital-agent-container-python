@@ -868,6 +868,16 @@ def test_header_mode_still_validates_jwt_before_the_protocol_check(logs):
 
 # ── Contract constants ───────────────────────────────────────
 
+def test_is_control_message_classifies_by_type():
+    """Handler output that is a JSON object (e.g. a chunk frame) must not be taken for control."""
+    from vital_agent_container.protocol import is_control_message
+    assert is_control_message({"type": "sdk.status", "status": "done", "in_reply_to": None})
+    assert is_control_message({"type": "sdk.error", "error": "busy", "detail": "", "in_reply_to": None})
+    assert not is_control_message({"aimp_chunk": {"message_id": "m", "index": 0, "total": 2}})
+    assert not is_control_message({"type": "message", "content": "handler-defined"})
+    assert not is_control_message([{"type": "sdk.status"}])  # AIMP lists are never control
+
+
 def test_close_codes_are_stable():
     """Clients match on these codes; changing one is a breaking change."""
     assert CloseCode.NORMAL == 1000
